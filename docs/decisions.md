@@ -62,22 +62,12 @@ The project is also a learning exercise. Splitting the application too early wou
 - A future module split remains available when justified.
 
 
----
-
-## ADR-004: Use Signed Amounts for Normalized Transactions
+## ADR-005: Normalize Bank CSVs Before Persistence
 
 **Status:** Accepted
 
-**Decision:**
+**Decision:** Bank CSV files are parsed into a normalized transaction representation before insertion into SQLite. The importer supports common date, description, amount, debit/credit, and reference-ID column names.
 
-Store normalized transaction amounts from the perspective of the account: positive for inflows and negative for outflows.
+**Rationale:** Financial institutions use different export column names and layouts. Keeping that variation at the import boundary prevents the `transactions` table from becoming bank-specific.
 
-**Reasoning:**
-
-A single signed amount works consistently across checking, savings, and investment cash activity and simplifies account-level cash-flow calculations.
-
-**Consequences:**
-
-- Import adapters must normalize each institution's debit/credit format into this convention.
-- Transfers will naturally produce a negative record in the source account and a positive record in the destination account.
-- Duplicate detection and transfer pairing remain separate concerns.
+**Scope:** Duplicate detection and transfer pairing are separate concerns and are not implemented in this commit.

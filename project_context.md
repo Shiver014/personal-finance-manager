@@ -35,7 +35,7 @@ The existing application already supports:
 - Recurring entries
 - SQLite persistence
 
-Sprint 1 established the financial account foundation. Sprint 2 is building normalized banking transactions and import workflows.
+Update 1 established the financial account foundation. Update 2 is building normalized banking transactions and import workflows.
 
 ## 4. Financial Data Sources
 
@@ -98,15 +98,15 @@ The existing database contains tables for:
 - `subscriptions`
 - `recurring`
 
-Sprint 1 added:
+Update 1 added:
 
 - `accounts`
 
-Sprint 2 Commit 2.1 adds:
+Update 2 - Commit 1 adds:
 
 - `transactions`
 
-Each normalized banking transaction references exactly one `account_id`. Positive amounts are inflows and negative amounts are outflows. CSV imports, duplicate detection, and transfer pairing remain separate later commits.
+Each normalized banking transaction references exactly one `account_id`. Positive amounts are inflows and negative amounts are outflows. CSV import is now implemented in Update 2 - Commit 2. Duplicate detection, transfer pairing, and reconciliation remain separate later commits.
 
 ## 7. Architecture Direction
 
@@ -140,14 +140,14 @@ We will not split the application prematurely. Refactoring should occur when the
 
 ## 9. Sprint Roadmap
 
-### Sprint 1 - Foundation
+### Update 1 - Foundation
 
 - Accounts database model
 - Account data-access layer
 - Accounts UI
 - Account creation/editing/deactivation
 
-### Sprint 2 - Banking
+### Update 2 - Banking
 
 - CSV import engine
 - Addition Financial imports
@@ -157,7 +157,7 @@ We will not split the application prematurely. Refactoring should occur when the
 - Transfer detection and recording
 - Reconciliation
 
-### Sprint 3 - Budgeting
+### Update 3 - Budgeting
 
 - Budget categories
 - Paycheck allocation
@@ -165,7 +165,7 @@ We will not split the application prematurely. Refactoring should occur when the
 - Budget vs. actual
 - Savings goals
 
-### Sprint 4 - Investments
+### Update 4 - Investments
 
 - Roth IRA tracking
 - Brokerage holdings
@@ -174,7 +174,7 @@ We will not split the application prematurely. Refactoring should occur when the
 - Dividends
 - Asset allocation
 
-### Sprint 5 - Forecasting
+### Update 5 - Forecasting
 
 - Cash-flow forecasting
 - Compound-interest scenarios

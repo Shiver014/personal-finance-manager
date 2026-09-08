@@ -4,7 +4,32 @@ All notable changes to the Personal Finance Manager are documented here.
 
 ## [Unreleased]
 
-### Sprint 2 - Commit 2.1: Transaction Data Model
+### Update 2 - Commit 2: CSV Import Foundation
+
+#### Added
+- Added flexible CSV parsing for common bank transaction exports.
+- Added date, description, amount, debit/credit, and external-ID field detection.
+- Added normalized signed-amount conversion during import.
+- Added CSV import preview with row validation feedback.
+- Added account selection before importing transactions.
+- Added `source="csv"`, `external_id`, and `imported_at` population for imported rows.
+- Added account `last_import` timestamp updates after successful imports.
+
+#### Safety / Scope
+- Imported transactions are never used to overwrite the account's current balance.
+- Invalid rows are skipped and reported rather than partially inserted.
+- Duplicate detection is intentionally deferred to the next commit; re-importing the same CSV can currently create duplicates.
+- Real personal bank exports were not committed or bundled. Synthetic CSV data is used for automated tests.
+
+#### Tests
+- Verified ISO and common U.S. date formats.
+- Verified signed amounts and parenthesized negative amounts.
+- Verified debit/credit column conversion.
+- Verified external-ID preservation.
+- Verified invalid-row handling.
+- Verified database insertion and `last_import` updates.
+
+### Update 2 - Commit 1: Transaction Data Model
 
 #### Added
 - Added normalized `transactions` table linked to `accounts` through `account_id`.
@@ -16,15 +41,13 @@ All notable changes to the Personal Finance Manager are documented here.
 
 #### Changed
 - Corrected the Accounts balance formatter to use the existing `fmt_money()` helper.
-- Updated project documentation for Sprint 2.
 
 #### Deferred
-- CSV parsing/import.
 - Duplicate detection rules.
 - Transfer pairing.
 - Transaction management UI.
 
-### Sprint 1 - Commit 1: Project Foundation
+### Update 1 - Commit 1: Project Foundation
 
 #### Added
 

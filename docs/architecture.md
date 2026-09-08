@@ -23,15 +23,7 @@ This structure is intentionally simple while the project is being developed and 
 The Accounts data-access layer now provides:
 
 - `add_account()`
-- `update_account()`
-- `set_account_active()`
 - `get_accounts()`
-
-The Transactions data-access layer now provides:
-
-- `add_transaction()`
-- `get_transactions()`
-- `get_transaction_count()`
 
 This is the beginning of a Data Access Layer (DAL). The purpose is to keep SQL operations reusable and reduce duplication between UI components.
 
@@ -72,3 +64,8 @@ SQLite
 ```
 
 A module split will be introduced only when it provides a clear maintenance benefit.
+
+
+## Update 2 - Commit 2: CSV Import Boundary
+
+CSV parsing is kept separate from the transaction database write path. `parse_csv_transactions()` converts common bank CSV layouts into a normalized internal structure, while `import_csv_transactions()` validates the selected active account and persists the normalized rows. This keeps bank-specific column variation out of the core transaction model. Duplicate detection is intentionally not part of this boundary yet.

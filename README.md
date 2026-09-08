@@ -6,7 +6,7 @@ The project is designed to bring banking, budgeting, forecasting, and investment
 
 ## Current Status
 
-**Development stage:** Sprint 2 - Banking & Transactions
+**Development stage:** Update 2 - Banking & Transactions
 
 ### Current application capabilities
 
@@ -22,6 +22,7 @@ The project is designed to bring banking, budgeting, forecasting, and investment
 
 ### Planned capabilities
 
+- CSV transaction import foundation with preview and validation
 - Addition Financial CSV imports
 - SoFi Checking/Savings CSV imports
 - Transaction browsing and filtering UI

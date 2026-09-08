@@ -1,9 +1,11 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import sqlite3
 import os
 import sys
-from datetime import date, timedelta
+import csv
+import re
+from datetime import date, timedelta, datetime
 import calendar
 
 # ── Database path ─────────────────────────────────────────────────────────────
@@ -1257,6 +1259,191 @@ class CombinedExpensesTab(tk.Frame):
         RecurringDialog(self,"expense",lambda:(self._reload(),self.on_change()))
 
 # ═════════════════════════════════════════════════════════════════════════════
+# CSV IMPORT
+# ═════════════════════════════════════════════════════════════════════════════
+CSV_DATE_FIELDS = (
+    "date", "transaction_date", "transactiondate", "posted_date", "posteddate",
+)
+CSV_DESCRIPTION_FIELDS = (
+    "description", "transaction_description", "transactiondescription",
+    "name", "memo", "details", "payee",
+)
+CSV_AMOUNT_FIELDS = ("amount", "transaction_amount", "transactionamount")
+CSV_DEBIT_FIELDS = ("debit", "withdrawal", "withdrawals", "debits")
+CSV_CREDIT_FIELDS = ("credit", "deposit", "deposits", "credits")
+CSV_EXTERNAL_ID_FIELDS = (
+    "transaction_id", "transactionid", "id", "reference", "reference_id", "referenceid"
+)
+
+
+def _normalize_csv_header(value):
+    """Normalize a CSV header for flexible field matching."""
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
+
+def _header_map(fieldnames):
+    return {_normalize_csv_header(name): name for name in (fieldnames or []) if name is not None}
+
+
+def _find_field(headers, candidates):
+    for candidate in candidates:
+        key = _normalize_csv_header(candidate)
+        if key in headers:
+            return headers[key]
+    return None
+
+
+def _parse_csv_date(value):
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("missing transaction date")
+
+    formats = (
+        "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
+        "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError as exc:
+        raise ValueError(f"unsupported date format: {value}") from exc
+
+
+def _parse_csv_amount(value):
+    """Parse common bank amount formats, preserving sign."""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.replace(",", "").replace("$", "").replace(" ", "")
+    text = text.replace("(", "").replace(")", "")
+    try:
+        amount = float(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid amount: {value}") from exc
+    return -abs(amount) if negative else amount
+
+
+def _row_to_transaction(row, headers, row_number):
+    date_field = _find_field(headers, CSV_DATE_FIELDS)
+    desc_field = _find_field(headers, CSV_DESCRIPTION_FIELDS)
+    amount_field = _find_field(headers, CSV_AMOUNT_FIELDS)
+    debit_field = _find_field(headers, CSV_DEBIT_FIELDS)
+    credit_field = _find_field(headers, CSV_CREDIT_FIELDS)
+    external_id_field = _find_field(headers, CSV_EXTERNAL_ID_FIELDS)
+
+    if not date_field:
+        raise ValueError("no transaction date column found")
+    if not desc_field:
+        raise ValueError("no description column found")
+    if not amount_field and not (debit_field or credit_field):
+        raise ValueError("no amount column or debit/credit columns found")
+
+    transaction_date = _parse_csv_date(row.get(date_field, ""))
+    description = str(row.get(desc_field, "")).strip()
+    if not description:
+        description = "Imported transaction"
+
+    if amount_field:
+        amount = _parse_csv_amount(row.get(amount_field, ""))
+    else:
+        debit = _parse_csv_amount(row.get(debit_field, "")) if debit_field else 0.0
+        credit = _parse_csv_amount(row.get(credit_field, "")) if credit_field else 0.0
+        amount = abs(credit) - abs(debit)
+
+    external_id = None
+    if external_id_field:
+        external_id = str(row.get(external_id_field, "")).strip() or None
+
+    return {
+        "transaction_date": transaction_date,
+        "description": description,
+        "amount": amount,
+        "external_id": external_id,
+        "row_number": row_number,
+    }
+
+
+def parse_csv_transactions(path, max_preview_rows=None):
+    """Parse a bank CSV into normalized transaction dictionaries.
+
+    This is intentionally bank-format tolerant rather than tied to one bank.
+    Duplicate detection is a later Update 2 commit, so this function only
+    normalizes and validates source rows.
+    """
+    rows = []
+    errors = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        headers = _header_map(reader.fieldnames)
+        if not reader.fieldnames:
+            raise ValueError("CSV file has no header row")
+
+        for row_number, row in enumerate(reader, start=2):
+            if not any(str(v or "").strip() for v in row.values()):
+                continue
+            try:
+                rows.append(_row_to_transaction(row, headers, row_number))
+            except ValueError as exc:
+                errors.append(f"Row {row_number}: {exc}")
+            if max_preview_rows is not None and len(rows) >= max_preview_rows:
+                break
+
+    return rows, errors
+
+
+def import_csv_transactions(path, account_id):
+    """Import validated CSV rows for one account and record the import time.
+
+    No duplicate detection is performed yet. Re-importing the same file can
+    therefore create duplicate transactions until the duplicate-detection
+    commit is implemented.
+    """
+    rows, errors = parse_csv_transactions(path)
+    if not rows:
+        raise ValueError("No valid transaction rows were found in the CSV.")
+
+    imported_at = datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        # Verify the selected account exists and is active.
+        account = conn.execute(
+            "SELECT id FROM accounts WHERE id=? AND is_active=1", (account_id,)
+        ).fetchone()
+        if not account:
+            raise ValueError("Selected account does not exist or is inactive.")
+
+        inserted = 0
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO transactions (
+                    account_id, transaction_date, description, amount,
+                    transaction_type, source, external_id, imported_at
+                ) VALUES (?, ?, ?, ?, 'uncategorized', 'csv', ?, ?)
+                """,
+                (account_id, row["transaction_date"], row["description"],
+                 row["amount"], row["external_id"], imported_at),
+            )
+            inserted += 1
+
+        conn.execute(
+            "UPDATE accounts SET last_import=? WHERE id=?",
+            (imported_at, account_id),
+        )
+        conn.commit()
+        return inserted, errors
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ACCOUNTS UI
 # ═════════════════════════════════════════════════════════════════════════════
 ACCOUNT_TYPES = ["Checking", "Savings", "Savings Plus", "Roth IRA", "Stocks"]
@@ -1343,6 +1530,7 @@ class AccountsTab(tk.Frame):
         header.pack(fill="x", padx=28, pady=(26, 10))
         tk.Label(header, text="Accounts", bg=BG, fg=TEXT, font=FONT_H1).pack(side="left")
         styled_btn(header, "+ Add Account", self._add, color=ACCENT3, fg=BG).pack(side="right")
+        styled_btn(header, "Import CSV", self._import_csv, color=ACCENT4, fg=BG).pack(side="right", padx=(0, 8))
 
         self.summary = tk.Label(self, text="", bg=BG, fg=TEXT_DIM, font=FONT_BODY, anchor="w")
         self.summary.pack(fill="x", padx=30, pady=(0, 12))
@@ -1409,10 +1597,151 @@ class AccountsTab(tk.Frame):
         set_account_active(account[0], new_state)
         self._changed()
 
+    def _import_csv(self):
+        accounts = get_accounts(active_only=True)
+        if not accounts:
+            messagebox.showinfo("No Active Accounts", "Add an active account before importing transactions.", parent=self)
+            return
+
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Select Bank CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        CSVImportDialog(self, path, accounts, on_import=self._changed)
+
     def _changed(self):
         self.refresh()
         if self.on_change:
             self.on_change()
+
+
+class CSVImportDialog(tk.Toplevel):
+    def __init__(self, parent, path, accounts, on_import=None):
+        super().__init__(parent)
+        self.title("Import Transactions from CSV")
+        self.configure(bg=BG)
+        self.geometry("920x600")
+        self.minsize(820, 520)
+        self.transient(parent)
+        self.grab_set()
+        self.path = path
+        self.accounts = accounts
+        self.on_import = on_import
+        self.preview_rows = []
+        self.parse_errors = []
+
+        tk.Label(self, text="CSV Transaction Import", bg=BG, fg=ACCENT4,
+                 font=FONT_H2).pack(pady=(16, 4))
+        tk.Label(self, text=os.path.basename(path), bg=BG, fg=TEXT_DIM,
+                 font=FONT_SMALL).pack(pady=(0, 10))
+
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=24, pady=(0, 10))
+        tk.Label(top, text="Import into:", bg=BG, fg=TEXT_DIM, font=FONT_BODY).pack(side="left")
+        self.account_var = tk.StringVar()
+        self.account_map = {}
+        for account in accounts:
+            label = f"{account[1]} — {account[2]} ({account[3]})"
+            self.account_map[label] = account[0]
+        self.account_combo = ttk.Combobox(top, textvariable=self.account_var,
+                                           values=list(self.account_map.keys()),
+                                           state="readonly", font=FONT_BODY, width=48)
+        self.account_combo.pack(side="left", padx=10)
+        self.account_combo.current(0)
+
+        self.summary = tk.Label(self, text="Reading CSV...", bg=BG, fg=TEXT_DIM,
+                                font=FONT_BODY, anchor="w")
+        self.summary.pack(fill="x", padx=24, pady=(0, 8))
+
+        card = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=24, pady=(0, 10))
+        cols = ("date", "description", "amount", "external_id")
+        self.tree = ttk.Treeview(card, columns=cols, show="headings", height=16)
+        for col, heading, width, anchor in (
+            ("date", "Date", 110, "w"),
+            ("description", "Description", 430, "w"),
+            ("amount", "Amount", 120, "e"),
+            ("external_id", "External ID", 180, "w"),
+        ):
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=width, anchor=anchor)
+        self.tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        scroll = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
+        scroll.pack(side="right", fill="y", pady=8)
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        self.warning = tk.Label(self, text="", bg=BG, fg=ACCENT3,
+                                font=FONT_SMALL, anchor="w", justify="left")
+        self.warning.pack(fill="x", padx=24, pady=(0, 6))
+
+        controls = tk.Frame(self, bg=BG)
+        controls.pack(fill="x", padx=24, pady=(0, 16))
+        styled_btn(controls, "Cancel", self.destroy, color=BORDER, fg=TEXT).pack(side="right")
+        self.import_btn = styled_btn(controls, "Import Valid Rows", self._do_import,
+                                     color=ACCENT, fg=BG)
+        self.import_btn.pack(side="right", padx=(0, 8))
+
+        self._load_preview()
+
+    def _load_preview(self):
+        try:
+            self.preview_rows, self.parse_errors = parse_csv_transactions(self.path, max_preview_rows=25)
+        except Exception as exc:
+            self.summary.configure(text=f"Unable to read CSV: {exc}", fg=ACCENT2)
+            self.import_btn.configure(state="disabled")
+            return
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for row in self.preview_rows:
+            self.tree.insert("", "end", values=(
+                row["transaction_date"], row["description"],
+                fmt_money(row["amount"]), row["external_id"] or "—",
+            ))
+
+        try:
+            all_rows, all_errors = parse_csv_transactions(self.path)
+            valid_count = len(all_rows)
+            error_count = len(all_errors)
+        except Exception as exc:
+            valid_count = len(self.preview_rows)
+            error_count = len(self.parse_errors)
+            self.parse_errors.append(str(exc))
+
+        self.summary.configure(
+            text=f"Previewing up to 25 rows • {valid_count} valid row(s) ready to import • {error_count} skipped row(s)"
+        )
+        self.warning.configure(
+            text="⚠ Duplicate detection is not implemented yet. Re-importing the same CSV can create duplicates."
+        )
+        if error_count:
+            self.warning.configure(
+                text=(self.warning.cget("text") +
+                      f"\nRows with errors will be skipped. First error: {self.parse_errors[0] if self.parse_errors else 'see validation results'}")
+            )
+
+    def _do_import(self):
+        label = self.account_var.get()
+        account_id = self.account_map.get(label)
+        if not account_id:
+            messagebox.showerror("Select Account", "Choose an active account for this CSV.", parent=self)
+            return
+        try:
+            inserted, errors = import_csv_transactions(self.path, account_id)
+        except Exception as exc:
+            messagebox.showerror("Import Failed", str(exc), parent=self)
+            return
+
+        msg = f"Imported {inserted} transaction(s)."
+        if errors:
+            msg += f"\nSkipped {len(errors)} row(s) that failed validation."
+        messagebox.showinfo("Import Complete", msg, parent=self)
+        self.destroy()
+        if self.on_import:
+            self.on_import()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
