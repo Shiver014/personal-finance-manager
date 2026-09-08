@@ -23,7 +23,15 @@ This structure is intentionally simple while the project is being developed and 
 The Accounts data-access layer now provides:
 
 - `add_account()`
+- `update_account()`
+- `set_account_active()`
 - `get_accounts()`
+
+The Transactions data-access layer now provides:
+
+- `add_transaction()`
+- `get_transactions()`
+- `get_transaction_count()`
 
 This is the beginning of a Data Access Layer (DAL). The purpose is to keep SQL operations reusable and reduce duplication between UI components.
 

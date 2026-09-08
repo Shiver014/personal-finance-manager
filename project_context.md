@@ -35,7 +35,7 @@ The existing application already supports:
 - Recurring entries
 - SQLite persistence
 
-Sprint 1 establishes the financial account foundation.
+Sprint 1 established the financial account foundation. Sprint 2 is building normalized banking transactions and import workflows.
 
 ## 4. Financial Data Sources
 
@@ -98,11 +98,15 @@ The existing database contains tables for:
 - `subscriptions`
 - `recurring`
 
-Sprint 1 adds:
+Sprint 1 added:
 
 - `accounts`
 
-The application will later connect transaction records to account IDs.
+Sprint 2 Commit 2.1 adds:
+
+- `transactions`
+
+Each normalized banking transaction references exactly one `account_id`. Positive amounts are inflows and negative amounts are outflows. CSV imports, duplicate detection, and transfer pairing remain separate later commits.
 
 ## 7. Architecture Direction
 
@@ -197,6 +201,6 @@ A commit is complete when:
 - The changes are pushed to GitHub.
 - The developer can explain why the implementation was chosen.## Development Database
 
-During development, the application uses `finance_data_test.db` as a sandbox database. The real `finance_data.db` is intentionally kept separate and is ignored by Git. When the real database is available, the `DATABASE_FILE` setting in `app.py` can be changed back to `finance_data.db`.
+The recovered `finance_data.db` is now the application database. It remains ignored by Git. Development and migration tests should be run against copies or sandbox databases rather than intentionally modifying the production database.
 
 

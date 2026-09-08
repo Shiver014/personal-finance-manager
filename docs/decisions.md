@@ -60,3 +60,24 @@ The project is also a learning exercise. Splitting the application too early wou
 - The application remains easy to navigate while learning.
 - New database operations should still be organized into clearly labeled sections.
 - A future module split remains available when justified.
+
+
+---
+
+## ADR-004: Use Signed Amounts for Normalized Transactions
+
+**Status:** Accepted
+
+**Decision:**
+
+Store normalized transaction amounts from the perspective of the account: positive for inflows and negative for outflows.
+
+**Reasoning:**
+
+A single signed amount works consistently across checking, savings, and investment cash activity and simplifies account-level cash-flow calculations.
+
+**Consequences:**
+
+- Import adapters must normalize each institution's debit/credit format into this convention.
+- Transfers will naturally produce a negative record in the source account and a positive record in the destination account.
+- Duplicate detection and transfer pairing remain separate concerns.

@@ -38,6 +38,7 @@ MAX_W = 860
 # ═════════════════════════════════════════════════════════════════════════════
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS paychecks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +78,29 @@ def init_db():
         is_active INTEGER DEFAULT 1,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 
+    -- Normalized banking transactions. Each row belongs to exactly one account.
+    -- Signed amount convention: positive = money in, negative = money out.
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL,
+        transaction_date TEXT NOT NULL,
+        posted_date TEXT,
+        description TEXT NOT NULL,
+        amount REAL NOT NULL,
+        category TEXT,
+        transaction_type TEXT NOT NULL DEFAULT 'uncategorized',
+        source TEXT NOT NULL DEFAULT 'manual',
+        external_id TEXT,
+        imported_at TEXT,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(account_id) REFERENCES accounts(id));
+
+    CREATE INDEX IF NOT EXISTS idx_transactions_account_date
+        ON transactions(account_id, transaction_date);
+    CREATE INDEX IF NOT EXISTS idx_transactions_external_id
+        ON transactions(account_id, external_id);
+
     -- Recurring schedules table
     -- type: 'paycheck' | 'expense' | 'loan_payment'
     -- frequency: 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'yearly'
@@ -115,7 +139,10 @@ def init_db():
             pass
     conn.commit(); conn.close()
 
-def get_conn(): return sqlite3.connect(DB_PATH)
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ACCOUNTS DATA ACCESS
@@ -185,6 +212,82 @@ def get_accounts(active_only=True):
         ).fetchall()
     conn.close()
     return rows
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TRANSACTIONS DATA ACCESS
+# ═════════════════════════════════════════════════════════════════════════════
+def add_transaction(account_id, transaction_date, description, amount,
+                    posted_date=None, category=None, transaction_type="uncategorized",
+                    source="manual", external_id=None, imported_at=None, note=None):
+    """Create a transaction tied to one financial account and return its ID.
+
+    Amounts use a signed convention: positive values are inflows and negative
+    values are outflows. Transfer pairing and duplicate detection are handled
+    in later Sprint 2 commits.
+    """
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO transactions (
+                account_id, transaction_date, posted_date, description, amount,
+                category, transaction_type, source, external_id, imported_at, note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (account_id, transaction_date, posted_date, description, amount,
+             category, transaction_type, source, external_id, imported_at, note),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_transactions(account_id=None):
+    """Return transactions newest-first, optionally limited to one account."""
+    conn = get_conn()
+    if account_id is None:
+        rows = conn.execute(
+            """
+            SELECT id, account_id, transaction_date, posted_date, description,
+                   amount, category, transaction_type, source, external_id,
+                   imported_at, note, created_at
+            FROM transactions
+            ORDER BY transaction_date DESC, id DESC
+            """
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, account_id, transaction_date, posted_date, description,
+                   amount, category, transaction_type, source, external_id,
+                   imported_at, note, created_at
+            FROM transactions
+            WHERE account_id = ?
+            ORDER BY transaction_date DESC, id DESC
+            """,
+            (account_id,),
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_transaction_count(account_id=None):
+    """Return the number of normalized banking transactions."""
+    conn = get_conn()
+    if account_id is None:
+        count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    else:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE account_id = ?", (account_id,)
+        ).fetchone()[0]
+    conn.close()
+    return count
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # RECURRING ENGINE

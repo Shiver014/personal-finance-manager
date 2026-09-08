@@ -1,16 +1,28 @@
-## [Unreleased] - Development Database Separation
-
-### Changed
-- Added a dedicated `finance_data_test.db` sandbox database for development.
-- Updated `app.py` to use a single `DATABASE_FILE` setting for database selection.
-- Added `finance_data_test.db` to `.gitignore` so test data is not committed.
-- Updated `build.py` and project context documentation to describe the configurable runtime database.
-
 # Changelog
 
 All notable changes to the Personal Finance Manager are documented here.
 
 ## [Unreleased]
+
+### Sprint 2 - Commit 2.1: Transaction Data Model
+
+#### Added
+- Added normalized `transactions` table linked to `accounts` through `account_id`.
+- Added signed-amount convention: positive values represent money in; negative values represent money out.
+- Added transaction provenance fields for future CSV imports (`source`, `external_id`, `imported_at`).
+- Added indexes for account/date lookups and future external-ID matching.
+- Added transaction DAL helpers: `add_transaction()`, `get_transactions()`, and `get_transaction_count()`.
+- Enabled SQLite foreign-key enforcement on application connections.
+
+#### Changed
+- Corrected the Accounts balance formatter to use the existing `fmt_money()` helper.
+- Updated project documentation for Sprint 2.
+
+#### Deferred
+- CSV parsing/import.
+- Duplicate detection rules.
+- Transfer pairing.
+- Transaction management UI.
 
 ### Sprint 1 - Commit 1: Project Foundation
 

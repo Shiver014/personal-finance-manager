@@ -6,7 +6,7 @@ The project is designed to bring banking, budgeting, forecasting, and investment
 
 ## Current Status
 
-**Development stage:** Sprint 1 - Foundation
+**Development stage:** Sprint 2 - Banking & Transactions
 
 ### Current application capabilities
 
@@ -17,13 +17,14 @@ The project is designed to bring banking, budgeting, forecasting, and investment
 - Subscription tracking
 - Recurring financial entries
 - SQLite-backed local storage
-- Initial financial account model
+- Financial account management
+- Normalized transaction data model linked to accounts
 
 ### Planned capabilities
 
 - Addition Financial CSV imports
 - SoFi Checking/Savings CSV imports
-- Account-specific transaction tracking
+- Transaction browsing and filtering UI
 - Transfer tracking between accounts
 - Budgeting and paycheck allocation
 - Net worth tracking
