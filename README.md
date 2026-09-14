@@ -19,6 +19,8 @@ The project is designed to bring banking, budgeting, forecasting, and investment
 - SQLite-backed local storage
 - Financial account management
 - Normalized transaction data model linked to accounts
+- CSV transaction importing with duplicate protection
+- Manual review and confirmation of internal account transfers
 
 ### Planned capabilities
 
@@ -26,7 +28,7 @@ The project is designed to bring banking, budgeting, forecasting, and investment
 - Addition Financial CSV imports
 - SoFi Checking/Savings CSV imports
 - Transaction browsing and filtering UI
-- Transfer tracking between accounts
+- Transfer-aware cash-flow reporting
 - Budgeting and paycheck allocation
 - Net worth tracking
 - Roth IRA and investment tracking

@@ -71,3 +71,25 @@ The project is also a learning exercise. Splitting the application too early wou
 **Rationale:** Financial institutions use different export column names and layouts. Keeping that variation at the import boundary prevents the `transactions` table from becoming bank-specific.
 
 **Scope:** Duplicate detection and transfer pairing are separate concerns and are not implemented in this commit.
+
+
+---
+
+## ADR-006: Transfers Require User Confirmation
+
+**Status:** Accepted
+
+**Decision:**
+
+Detect likely internal transfers conservatively, but do not classify them automatically. The user confirms a candidate pair before both transactions are marked as transfers.
+
+**Reasoning:**
+
+Two unrelated transactions can share the same amount and occur close together. Automatic classification could distort income, expense, and savings analytics. Requiring confirmation preserves accuracy while still reducing manual work.
+
+**Consequences:**
+
+- Candidate matching requires equal-and-opposite amounts, different accounts, and nearby dates.
+- Ambiguous matches are not suggested.
+- Confirmed pairs are linked with `linked_transaction_id`.
+- Either side can later be unlinked without deleting transaction history.

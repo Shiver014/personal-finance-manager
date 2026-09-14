@@ -87,3 +87,10 @@ The preferred direction is to introduce account foreign keys and migration logic
 ## Update 2 - Commit 2: CSV Import
 
 CSV imports write normalized rows into `transactions`. Imported rows use `source='csv'` and record `imported_at`; a bank-provided transaction/reference identifier is stored in `external_id` when available. The importer does not overwrite `accounts.current_balance`, because a CSV may represent only a partial history. The account's `last_import` timestamp is updated after a successful import. Duplicate detection is implemented in Update 2 - Commit 3. Rows with bank-provided IDs are matched by `(account_id, external_id)`. Rows without IDs are matched with a SHA-256 fingerprint built from account, date, normalized description, amount, and occurrence number. Existing imported rows are backfilled during migration.
+
+
+## Transfer Linking
+
+Update 2 - Commit 4 adds `linked_transaction_id` to `transactions`. A confirmed internal transfer is represented by two transaction rows: a negative outflow on the source account and an equal positive inflow on the destination account. Each row points to the other through `linked_transaction_id`, and both are classified as `transaction_type = 'transfer'`.
+
+Transfer candidates are not classified automatically. The application suggests only unique equal-and-opposite matches across different owned accounts within a three-day window, and the user must confirm the pair.

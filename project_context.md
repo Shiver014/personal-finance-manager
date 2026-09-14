@@ -106,7 +106,7 @@ Update 2 - Commit 1 adds:
 
 - `transactions`
 
-Each normalized banking transaction references exactly one `account_id`. Positive amounts are inflows and negative amounts are outflows. CSV import is implemented in Update 2 - Commit 2. Duplicate detection is implemented in Update 2 - Commit 3 using bank IDs first and deterministic fingerprints as a fallback. Transfer pairing and reconciliation remain later commits.
+Each normalized banking transaction references exactly one `account_id`. Positive amounts are inflows and negative amounts are outflows. CSV import is implemented in Update 2 - Commit 2. Duplicate detection is implemented in Update 2 - Commit 3 using bank IDs first and deterministic fingerprints as a fallback. Update 2 - Commit 4 adds conservative transfer candidate detection plus manual confirmation. Confirmed transfers are linked across both account-side transaction rows and classified separately from income/expenses. Reconciliation remains a later commit.
 
 ## 7. Architecture Direction
 
@@ -154,7 +154,7 @@ We will not split the application prematurely. Refactoring should occur when the
 - SoFi imports
 - Account-specific transactions
 - Duplicate detection ✅
-- Transfer detection and recording
+- Transfer detection and recording ✅
 - Reconciliation
 
 ### Update 3 - Budgeting

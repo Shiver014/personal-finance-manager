@@ -69,3 +69,18 @@ A module split will be introduced only when it provides a clear maintenance bene
 ## Update 2 - Commit 2: CSV Import Boundary
 
 CSV parsing is kept separate from the transaction database write path. `parse_csv_transactions()` converts common bank CSV layouts into a normalized internal structure, while `import_csv_transactions()` validates the selected active account and persists the normalized rows. This keeps bank-specific column variation out of the core transaction model. Duplicate detection is intentionally not part of this boundary yet.
+
+
+## Transfer Review Flow
+
+```text
+Normalized transactions
+        ↓
+Conservative candidate matching
+        ↓
+Transfer Review UI
+        ↓ user confirmation
+Linked transfer pair
+```
+
+Candidate matching is deliberately separate from confirmation so an accidental equal-amount transaction is not silently reclassified.

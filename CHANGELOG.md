@@ -2,6 +2,20 @@
 
 ## 2026-09-13
 
+### Update 2 - Commit 4: Transfer Detection & Handling
+
+- Added conservative internal-transfer candidate detection using equal-and-opposite amounts across different owned accounts within a three-day window.
+- Ambiguous matches are intentionally excluded from suggestions.
+- Added manual Transfer Review UI so candidates are never classified automatically.
+- Confirmed transfer pairs are linked bidirectionally through `linked_transaction_id`.
+- Confirmed transfer transactions are classified with `transaction_type="transfer"` and category `Transfer`.
+- Added the ability to unlink a confirmed transfer without deleting either transaction.
+- CSV import results now report when potential transfer pairs are ready for review.
+- Added migration/index support for `linked_transaction_id`.
+- Added automated transfer detection, confirmation, ambiguity, date-window, unlink, and migration tests.
+
+## 2026-09-13
+
 ### Update 2 - Commit 3: Duplicate Detection
 
 - Added duplicate-aware CSV imports.

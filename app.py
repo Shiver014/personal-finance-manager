@@ -95,6 +95,7 @@ def init_db():
         source TEXT NOT NULL DEFAULT 'manual',
         external_id TEXT,
         fingerprint TEXT,
+        linked_transaction_id INTEGER,
         imported_at TEXT,
         note TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -136,6 +137,7 @@ def init_db():
         ("loans",         "active",       "INTEGER DEFAULT 1"),
         ("accounts",      "created_at",  "TEXT DEFAULT CURRENT_TIMESTAMP"),
         ("transactions",  "fingerprint", "TEXT"),
+        ("transactions",  "linked_transaction_id", "INTEGER"),
     ]
     for tbl, col, typedef in migrations:
         try:
@@ -146,6 +148,10 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_transactions_fingerprint "
         "ON transactions(account_id, fingerprint)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transactions_linked_transfer "
+        "ON transactions(linked_transaction_id)"
     )
 
     # Backfill fingerprints for older CSV transactions that predate duplicate
@@ -250,8 +256,8 @@ def add_transaction(account_id, transaction_date, description, amount,
     """Create a transaction tied to one financial account and return its ID.
 
     Amounts use a signed convention: positive values are inflows and negative
-    values are outflows. Transfer pairing and duplicate detection are handled
-    in later Sprint 2 commits.
+    values are outflows. Confirmed transfers are linked to their opposite-side
+    transaction and classified separately from income and expenses.
     """
     conn = get_conn()
     try:
@@ -315,6 +321,148 @@ def get_transaction_count(account_id=None):
         ).fetchone()[0]
     conn.close()
     return count
+
+
+def get_transfer_candidates(max_days=3):
+    """Return conservative, one-to-one transfer candidates between owned accounts.
+
+    A candidate requires equal-and-opposite amounts, different accounts, and dates
+    within ``max_days``. Ambiguous matches are intentionally excluded so a user
+    must confirm only high-confidence candidate pairs.
+    """
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT t.id, t.account_id, t.transaction_date, t.description, t.amount,
+               a.institution, a.account_name
+        FROM transactions t
+        JOIN accounts a ON a.id = t.account_id
+        WHERE t.amount != 0
+          AND COALESCE(t.transaction_type, 'uncategorized') != 'transfer'
+          AND t.linked_transaction_id IS NULL
+        ORDER BY t.transaction_date, t.id
+        """
+    ).fetchall()
+    conn.close()
+
+    outflows = [r for r in rows if float(r[4]) < 0]
+    inflows = [r for r in rows if float(r[4]) > 0]
+
+    def compatible(outflow, inflow):
+        if outflow[1] == inflow[1]:
+            return False
+        if round(abs(float(outflow[4])), 2) != round(abs(float(inflow[4])), 2):
+            return False
+        try:
+            delta = abs((date.fromisoformat(inflow[2]) - date.fromisoformat(outflow[2])).days)
+        except (TypeError, ValueError):
+            return False
+        return delta <= max_days
+
+    out_matches = {o[0]: [i for i in inflows if compatible(o, i)] for o in outflows}
+    in_matches = {i[0]: [o for o in outflows if compatible(o, i)] for i in inflows}
+
+    candidates = []
+    for outflow in outflows:
+        matches = out_matches[outflow[0]]
+        if len(matches) != 1:
+            continue
+        inflow = matches[0]
+        if len(in_matches[inflow[0]]) != 1:
+            continue
+        candidates.append((outflow, inflow))
+    return candidates
+
+
+def confirm_transfer_pair(outflow_id, inflow_id):
+    """Confirm two opposite-side transactions as one internal transfer."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT id, account_id, transaction_date, amount, transaction_type, linked_transaction_id
+               FROM transactions WHERE id IN (?, ?)""",
+            (outflow_id, inflow_id),
+        ).fetchall()
+        if len(rows) != 2:
+            raise ValueError("Both transfer transactions must exist.")
+        by_id = {r[0]: r for r in rows}
+        outflow = by_id.get(outflow_id)
+        inflow = by_id.get(inflow_id)
+        if outflow is None or inflow is None:
+            raise ValueError("Unable to load the selected transfer pair.")
+        if outflow[1] == inflow[1]:
+            raise ValueError("A transfer must move money between two different accounts.")
+        if float(outflow[3]) >= 0 or float(inflow[3]) <= 0:
+            raise ValueError("Transfer pair must contain one outflow and one inflow.")
+        if round(abs(float(outflow[3])), 2) != round(abs(float(inflow[3])), 2):
+            raise ValueError("Transfer amounts must be equal and opposite.")
+        if outflow[5] is not None or inflow[5] is not None:
+            raise ValueError("One of these transactions is already linked to a transfer.")
+
+        conn.execute(
+            "UPDATE transactions SET transaction_type='transfer', category='Transfer', linked_transaction_id=? WHERE id=?",
+            (inflow_id, outflow_id),
+        )
+        conn.execute(
+            "UPDATE transactions SET transaction_type='transfer', category='Transfer', linked_transaction_id=? WHERE id=?",
+            (outflow_id, inflow_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def unlink_transfer(transaction_id):
+    """Undo a confirmed transfer link while preserving both transaction rows."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT linked_transaction_id FROM transactions WHERE id=?",
+            (transaction_id,),
+        ).fetchone()
+        if not row or row[0] is None:
+            return False
+        linked_id = row[0]
+        conn.execute(
+            """UPDATE transactions
+               SET transaction_type='uncategorized',
+                   category=CASE WHEN category='Transfer' THEN NULL ELSE category END,
+                   linked_transaction_id=NULL
+               WHERE id IN (?, ?)""",
+            (transaction_id, linked_id),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_confirmed_transfers():
+    """Return each confirmed transfer once, with source/destination account labels."""
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT o.id, o.transaction_date, ao.institution, ao.account_name, o.description,
+               i.id, i.transaction_date, ai.institution, ai.account_name, i.description,
+               ABS(o.amount)
+        FROM transactions o
+        JOIN transactions i ON i.id = o.linked_transaction_id
+        JOIN accounts ao ON ao.id = o.account_id
+        JOIN accounts ai ON ai.id = i.account_id
+        WHERE o.transaction_type='transfer'
+          AND i.transaction_type='transfer'
+          AND o.amount < 0 AND i.amount > 0
+        ORDER BY MAX(o.transaction_date, i.transaction_date) DESC, o.id DESC
+        """
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1527,6 +1675,182 @@ def import_csv_transactions(path, account_id):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TRANSFER REVIEW
+# ═════════════════════════════════════════════════════════════════════════════
+class TransferReviewDialog(tk.Toplevel):
+    """Review likely internal transfers before classifying them as transfers."""
+    def __init__(self, parent, on_change=None):
+        super().__init__(parent)
+        self.title("Review Transfers")
+        self.configure(bg=BG)
+        self.geometry("1180x650")
+        self.minsize(980, 540)
+        self.transient(parent)
+        self.grab_set()
+        self.on_change = on_change
+        self.candidate_map = {}
+
+        tk.Label(self, text="Transfer Review", bg=BG, fg=ACCENT4, font=FONT_H2).pack(pady=(16, 4))
+        tk.Label(
+            self,
+            text=("Finance Tracker suggests only unique equal-and-opposite transactions across different accounts. "
+                  "Nothing is classified as a transfer until you confirm it."),
+            bg=BG, fg=TEXT_DIM, font=FONT_SMALL, wraplength=1080, justify="left",
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=24, pady=(0, 10))
+
+        self.candidate_frame = tk.Frame(self.notebook, bg=BG)
+        self.confirmed_frame = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self.candidate_frame, text="Candidates")
+        self.notebook.add(self.confirmed_frame, text="Confirmed Transfers")
+
+        self._build_candidates()
+        self._build_confirmed()
+        self._refresh()
+
+        footer = tk.Frame(self, bg=BG)
+        footer.pack(fill="x", padx=24, pady=(0, 16))
+        styled_btn(footer, "Close", self.destroy, color=BORDER, fg=TEXT).pack(side="right")
+        styled_btn(footer, "Refresh", self._refresh, color=ACCENT4, fg=BG).pack(side="right", padx=(0, 8))
+
+    def _build_candidates(self):
+        self.candidate_summary = tk.Label(
+            self.candidate_frame, text="", bg=BG, fg=TEXT_DIM, font=FONT_SMALL, anchor="w"
+        )
+        self.candidate_summary.pack(fill="x", pady=(10, 6))
+
+        card = tk.Frame(self.candidate_frame, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+        cols = ("out_date", "from_account", "out_desc", "in_date", "to_account", "in_desc", "amount")
+        self.candidate_tree = ttk.Treeview(card, columns=cols, show="headings", height=13)
+        specs = (
+            ("out_date", "Out Date", 90, "w"),
+            ("from_account", "From Account", 155, "w"),
+            ("out_desc", "Outflow Description", 220, "w"),
+            ("in_date", "In Date", 90, "w"),
+            ("to_account", "To Account", 155, "w"),
+            ("in_desc", "Inflow Description", 220, "w"),
+            ("amount", "Amount", 105, "e"),
+        )
+        for col, title, width, anchor in specs:
+            self.candidate_tree.heading(col, text=title)
+            self.candidate_tree.column(col, width=width, anchor=anchor)
+        self.candidate_tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.candidate_tree.yview)
+        sb.pack(side="right", fill="y", pady=8)
+        self.candidate_tree.configure(yscrollcommand=sb.set)
+
+        controls = tk.Frame(self.candidate_frame, bg=BG)
+        controls.pack(fill="x", pady=(8, 0))
+        styled_btn(controls, "Confirm Selected Transfer", self._confirm_selected, color=ACCENT, fg=BG).pack(side="left")
+
+    def _build_confirmed(self):
+        self.confirmed_summary = tk.Label(
+            self.confirmed_frame, text="", bg=BG, fg=TEXT_DIM, font=FONT_SMALL, anchor="w"
+        )
+        self.confirmed_summary.pack(fill="x", pady=(10, 6))
+
+        card = tk.Frame(self.confirmed_frame, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+        cols = ("out_date", "from_account", "in_date", "to_account", "amount")
+        self.confirmed_tree = ttk.Treeview(card, columns=cols, show="headings", height=13)
+        specs = (
+            ("out_date", "Out Date", 110, "w"),
+            ("from_account", "From Account", 260, "w"),
+            ("in_date", "In Date", 110, "w"),
+            ("to_account", "To Account", 260, "w"),
+            ("amount", "Amount", 130, "e"),
+        )
+        for col, title, width, anchor in specs:
+            self.confirmed_tree.heading(col, text=title)
+            self.confirmed_tree.column(col, width=width, anchor=anchor)
+        self.confirmed_tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.confirmed_tree.yview)
+        sb.pack(side="right", fill="y", pady=8)
+        self.confirmed_tree.configure(yscrollcommand=sb.set)
+
+        controls = tk.Frame(self.confirmed_frame, bg=BG)
+        controls.pack(fill="x", pady=(8, 0))
+        styled_btn(controls, "Unlink Selected", self._unlink_selected, color=ACCENT2, fg=TEXT).pack(side="left")
+
+    def _refresh(self):
+        for item in self.candidate_tree.get_children():
+            self.candidate_tree.delete(item)
+        self.candidate_map.clear()
+        candidates = get_transfer_candidates()
+        for idx, (outflow, inflow) in enumerate(candidates):
+            iid = str(idx)
+            self.candidate_map[iid] = (outflow[0], inflow[0])
+            self.candidate_tree.insert("", "end", iid=iid, values=(
+                outflow[2],
+                f"{outflow[5]} — {outflow[6]}",
+                outflow[3],
+                inflow[2],
+                f"{inflow[5]} — {inflow[6]}",
+                inflow[3],
+                fmt_money(abs(float(outflow[4]))),
+            ))
+        self.candidate_summary.configure(
+            text=f"{len(candidates)} high-confidence candidate transfer pair(s) awaiting review."
+        )
+
+        for item in self.confirmed_tree.get_children():
+            self.confirmed_tree.delete(item)
+        confirmed = get_confirmed_transfers()
+        for row in confirmed:
+            out_id, out_date, out_inst, out_account, out_desc, in_id, in_date, in_inst, in_account, in_desc, amount = row
+            self.confirmed_tree.insert("", "end", iid=str(out_id), values=(
+                out_date, f"{out_inst} — {out_account}", in_date,
+                f"{in_inst} — {in_account}", fmt_money(amount),
+            ))
+        self.confirmed_summary.configure(text=f"{len(confirmed)} confirmed transfer pair(s).")
+
+    def _confirm_selected(self):
+        selection = self.candidate_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select Transfer", "Select a candidate transfer first.", parent=self)
+            return
+        outflow_id, inflow_id = self.candidate_map[selection[0]]
+        if not messagebox.askyesno(
+            "Confirm Transfer",
+            "Classify both selected transactions as one internal transfer?",
+            parent=self,
+        ):
+            return
+        try:
+            confirm_transfer_pair(outflow_id, inflow_id)
+        except Exception as exc:
+            messagebox.showerror("Transfer Error", str(exc), parent=self)
+            return
+        self._refresh()
+        if self.on_change:
+            self.on_change()
+
+    def _unlink_selected(self):
+        selection = self.confirmed_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select Transfer", "Select a confirmed transfer first.", parent=self)
+            return
+        transaction_id = int(selection[0])
+        if not messagebox.askyesno(
+            "Unlink Transfer",
+            "Return both transactions to uncategorized status? The transactions themselves will be kept.",
+            parent=self,
+        ):
+            return
+        try:
+            unlink_transfer(transaction_id)
+        except Exception as exc:
+            messagebox.showerror("Transfer Error", str(exc), parent=self)
+            return
+        self._refresh()
+        if self.on_change:
+            self.on_change()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ACCOUNTS UI
 # ═════════════════════════════════════════════════════════════════════════════
 ACCOUNT_TYPES = ["Checking", "Savings", "Savings Plus", "Roth IRA", "Stocks"]
@@ -1614,6 +1938,7 @@ class AccountsTab(tk.Frame):
         tk.Label(header, text="Accounts", bg=BG, fg=TEXT, font=FONT_H1).pack(side="left")
         styled_btn(header, "+ Add Account", self._add, color=ACCENT3, fg=BG).pack(side="right")
         styled_btn(header, "Import CSV", self._import_csv, color=ACCENT4, fg=BG).pack(side="right", padx=(0, 8))
+        styled_btn(header, "Review Transfers", self._review_transfers, color=ACCENT5, fg=BG).pack(side="right", padx=(0, 8))
 
         self.summary = tk.Label(self, text="", bg=BG, fg=TEXT_DIM, font=FONT_BODY, anchor="w")
         self.summary.pack(fill="x", padx=30, pady=(0, 12))
@@ -1650,7 +1975,11 @@ class AccountsTab(tk.Frame):
         rows = get_accounts(active_only=False)
         total = sum(float(r[5] or 0) for r in rows if r[7])
         active_count = sum(1 for r in rows if r[7])
-        self.summary.configure(text=f"{active_count} active account(s)  •  Total tracked balance: {fmt_money(total)}")
+        transfer_candidates = len(get_transfer_candidates())
+        self.summary.configure(
+            text=(f"{active_count} active account(s)  •  Total tracked balance: {fmt_money(total)}"
+                  f"  •  {transfer_candidates} transfer candidate(s)")
+        )
         for r in rows:
             self.tree.insert("", "end", iid=str(r[0]), values=(
                 r[1], r[2], r[3], r[4] or "—", fmt_money(r[5] or 0), "Active" if r[7] else "Inactive"
@@ -1679,6 +2008,9 @@ class AccountsTab(tk.Frame):
         new_state = not bool(account[7])
         set_account_active(account[0], new_state)
         self._changed()
+
+    def _review_transfers(self):
+        TransferReviewDialog(self, on_change=self._changed)
 
     def _import_csv(self):
         accounts = get_accounts(active_only=True)
@@ -1822,6 +2154,9 @@ class CSVImportDialog(tk.Toplevel):
         msg += f"\nSkipped {duplicates} duplicate transaction(s)."
         if errors:
             msg += f"\nSkipped {len(errors)} row(s) that failed validation."
+        candidate_count = len(get_transfer_candidates())
+        if candidate_count:
+            msg += f"\n{candidate_count} potential internal transfer pair(s) are ready for review."
         messagebox.showinfo("Import Complete", msg, parent=self)
         self.destroy()
         if self.on_import:
