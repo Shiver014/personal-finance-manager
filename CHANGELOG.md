@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-13
+
+### Update 2 - Commit 3: Duplicate Detection
+
+- Added duplicate-aware CSV imports.
+- Bank-provided `external_id` values are used as the primary duplicate key when present.
+- Transactions without external IDs use a SHA-256 fingerprint based on account, date, normalized description, signed amount, and occurrence number.
+- Added a `fingerprint` column and index to `transactions` with safe backfill for older imported rows.
+- Import results now report new transactions, duplicates skipped, and invalid rows skipped.
+- Legitimate identical same-day transactions are preserved through occurrence numbering.
+- Transfer pairing remains deferred to Update 2 - Commit 4.
+
+
 All notable changes to the Personal Finance Manager are documented here.
 
 ## [Unreleased]
@@ -18,7 +31,7 @@ All notable changes to the Personal Finance Manager are documented here.
 #### Safety / Scope
 - Imported transactions are never used to overwrite the account's current balance.
 - Invalid rows are skipped and reported rather than partially inserted.
-- Duplicate detection is intentionally deferred to the next commit; re-importing the same CSV can currently create duplicates.
+- Duplicate detection was added in Update 2 - Commit 3.
 - Real personal bank exports were not committed or bundled. Synthetic CSV data is used for automated tests.
 
 #### Tests

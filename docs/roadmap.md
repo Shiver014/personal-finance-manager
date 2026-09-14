@@ -11,7 +11,7 @@
 - [ ] Transaction-to-account relationships
 - [ ] Addition Financial CSV import profile
 - [ ] SoFi Checking/Savings CSV import profile
-- [ ] Duplicate transaction detection
+- [x] Duplicate transaction detection
 - [ ] Transfer handling
 - [ ] Account reconciliation
 

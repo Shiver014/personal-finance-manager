@@ -5,6 +5,7 @@ import os
 import sys
 import csv
 import re
+import hashlib
 from datetime import date, timedelta, datetime
 import calendar
 
@@ -93,6 +94,7 @@ def init_db():
         transaction_type TEXT NOT NULL DEFAULT 'uncategorized',
         source TEXT NOT NULL DEFAULT 'manual',
         external_id TEXT,
+        fingerprint TEXT,
         imported_at TEXT,
         note TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -133,12 +135,36 @@ def init_db():
         ("loan_payments", "recurring_id", "INTEGER"),
         ("loans",         "active",       "INTEGER DEFAULT 1"),
         ("accounts",      "created_at",  "TEXT DEFAULT CURRENT_TIMESTAMP"),
+        ("transactions",  "fingerprint", "TEXT"),
     ]
     for tbl, col, typedef in migrations:
         try:
             conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typedef}")
         except Exception:
             pass
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transactions_fingerprint "
+        "ON transactions(account_id, fingerprint)"
+    )
+
+    # Backfill fingerprints for older CSV transactions that predate duplicate
+    # detection. Occurrence numbers preserve legitimate same-day identical rows.
+    existing = conn.execute(
+        """SELECT id, account_id, transaction_date, description, amount
+           FROM transactions
+           WHERE source='csv' AND (fingerprint IS NULL OR fingerprint='')
+           ORDER BY account_id, transaction_date, id"""
+    ).fetchall()
+    occurrence_counts = {}
+    for tx_id, account_id, tx_date, description, amount in existing:
+        base_key = (account_id, tx_date, _normalize_description(description), f"{float(amount):.2f}")
+        occurrence_counts[base_key] = occurrence_counts.get(base_key, 0) + 1
+        fp = _transaction_fingerprint(
+            account_id, tx_date, description, amount, occurrence_counts[base_key]
+        )
+        conn.execute("UPDATE transactions SET fingerprint=? WHERE id=?", (fp, tx_id))
+
     conn.commit(); conn.close()
 
 def get_conn():
@@ -1328,6 +1354,23 @@ def _parse_csv_amount(value):
     return -abs(amount) if negative else amount
 
 
+def _normalize_description(value):
+    """Normalize transaction descriptions for stable duplicate fingerprints."""
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _transaction_fingerprint(account_id, transaction_date, description, amount, occurrence):
+    """Return a stable SHA-256 fingerprint for transactions without bank IDs."""
+    payload = "|".join((
+        str(account_id),
+        str(transaction_date),
+        _normalize_description(description),
+        f"{float(amount):.2f}",
+        str(int(occurrence)),
+    ))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _row_to_transaction(row, headers, row_number):
     date_field = _find_field(headers, CSV_DATE_FIELDS)
     desc_field = _find_field(headers, CSV_DESCRIPTION_FIELDS)
@@ -1372,8 +1415,8 @@ def parse_csv_transactions(path, max_preview_rows=None):
     """Parse a bank CSV into normalized transaction dictionaries.
 
     This is intentionally bank-format tolerant rather than tied to one bank.
-    Duplicate detection is a later Update 2 commit, so this function only
-    normalizes and validates source rows.
+    Rows are also assigned occurrence numbers so duplicate detection can
+    preserve legitimate identical same-day transactions without bank IDs.
     """
     rows = []
     errors = []
@@ -1393,15 +1436,25 @@ def parse_csv_transactions(path, max_preview_rows=None):
             if max_preview_rows is not None and len(rows) >= max_preview_rows:
                 break
 
+    occurrence_counts = {}
+    for row in rows:
+        base_key = (
+            row["transaction_date"],
+            _normalize_description(row["description"]),
+            f"{float(row['amount']):.2f}",
+        )
+        occurrence_counts[base_key] = occurrence_counts.get(base_key, 0) + 1
+        row["occurrence"] = occurrence_counts[base_key]
+
     return rows, errors
 
 
 def import_csv_transactions(path, account_id):
-    """Import validated CSV rows for one account and record the import time.
+    """Import only new CSV rows for one account and return import statistics.
 
-    No duplicate detection is performed yet. Re-importing the same file can
-    therefore create duplicate transactions until the duplicate-detection
-    commit is implemented.
+    Duplicate priority:
+      1. bank-provided external/reference ID when available;
+      2. deterministic fingerprint using account/date/description/amount/occurrence.
     """
     rows, errors = parse_csv_transactions(path)
     if not rows:
@@ -1410,7 +1463,6 @@ def import_csv_transactions(path, account_id):
     imported_at = datetime.now().isoformat(timespec="seconds")
     conn = get_conn()
     try:
-        # Verify the selected account exists and is active.
         account = conn.execute(
             "SELECT id FROM accounts WHERE id=? AND is_active=1", (account_id,)
         ).fetchone()
@@ -1418,16 +1470,46 @@ def import_csv_transactions(path, account_id):
             raise ValueError("Selected account does not exist or is inactive.")
 
         inserted = 0
+        duplicates = 0
+
         for row in rows:
+            external_id = row["external_id"]
+            fingerprint = _transaction_fingerprint(
+                account_id,
+                row["transaction_date"],
+                row["description"],
+                row["amount"],
+                row.get("occurrence", 1),
+            )
+
+            if external_id:
+                duplicate = conn.execute(
+                    """SELECT 1 FROM transactions
+                       WHERE account_id=? AND external_id=?
+                       LIMIT 1""",
+                    (account_id, external_id),
+                ).fetchone()
+            else:
+                duplicate = conn.execute(
+                    """SELECT 1 FROM transactions
+                       WHERE account_id=? AND fingerprint=?
+                       LIMIT 1""",
+                    (account_id, fingerprint),
+                ).fetchone()
+
+            if duplicate:
+                duplicates += 1
+                continue
+
             conn.execute(
                 """
                 INSERT INTO transactions (
                     account_id, transaction_date, description, amount,
-                    transaction_type, source, external_id, imported_at
-                ) VALUES (?, ?, ?, ?, 'uncategorized', 'csv', ?, ?)
+                    transaction_type, source, external_id, fingerprint, imported_at
+                ) VALUES (?, ?, ?, ?, 'uncategorized', 'csv', ?, ?, ?)
                 """,
                 (account_id, row["transaction_date"], row["description"],
-                 row["amount"], row["external_id"], imported_at),
+                 row["amount"], external_id, fingerprint, imported_at),
             )
             inserted += 1
 
@@ -1436,12 +1518,13 @@ def import_csv_transactions(path, account_id):
             (imported_at, account_id),
         )
         conn.commit()
-        return inserted, errors
+        return inserted, duplicates, errors
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ACCOUNTS UI
@@ -1715,7 +1798,7 @@ class CSVImportDialog(tk.Toplevel):
             text=f"Previewing up to 25 rows • {valid_count} valid row(s) ready to import • {error_count} skipped row(s)"
         )
         self.warning.configure(
-            text="⚠ Duplicate detection is not implemented yet. Re-importing the same CSV can create duplicates."
+            text="Duplicate protection is active. Previously imported transactions will be skipped automatically."
         )
         if error_count:
             self.warning.configure(
@@ -1730,12 +1813,13 @@ class CSVImportDialog(tk.Toplevel):
             messagebox.showerror("Select Account", "Choose an active account for this CSV.", parent=self)
             return
         try:
-            inserted, errors = import_csv_transactions(self.path, account_id)
+            inserted, duplicates, errors = import_csv_transactions(self.path, account_id)
         except Exception as exc:
             messagebox.showerror("Import Failed", str(exc), parent=self)
             return
 
-        msg = f"Imported {inserted} transaction(s)."
+        msg = f"Imported {inserted} new transaction(s)."
+        msg += f"\nSkipped {duplicates} duplicate transaction(s)."
         if errors:
             msg += f"\nSkipped {len(errors)} row(s) that failed validation."
         messagebox.showinfo("Import Complete", msg, parent=self)

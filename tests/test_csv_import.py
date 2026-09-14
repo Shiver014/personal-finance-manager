@@ -67,8 +67,9 @@ class CSVImportTests(unittest.TestCase):
             ["08/02/2026", "GROCERY", "-84.23", "abc-2"],
         ])
 
-        inserted, errors = app.import_csv_transactions(path, self.account_id)
+        inserted, duplicates, errors = app.import_csv_transactions(path, self.account_id)
         self.assertEqual(inserted, 2)
+        self.assertEqual(duplicates, 0)
         self.assertEqual(errors, [])
 
         transactions = app.get_transactions(self.account_id)
@@ -82,15 +83,62 @@ class CSVImportTests(unittest.TestCase):
         conn.close()
         self.assertTrue(last_import)
 
-    def test_duplicate_detection_is_deferred(self):
-        path = self.write_csv("repeat.csv", [
+    def test_external_id_duplicate_is_skipped(self):
+        path = self.write_csv("repeat_id.csv", [
             ["Date", "Description", "Amount", "Transaction ID"],
             ["08/01/2026", "PAYROLL", "1500.00", "abc-1"],
         ])
 
+        first = app.import_csv_transactions(path, self.account_id)
+        second = app.import_csv_transactions(path, self.account_id)
+        self.assertEqual(first[:2], (1, 0))
+        self.assertEqual(second[:2], (0, 1))
+        self.assertEqual(app.get_transaction_count(self.account_id), 1)
+
+    def test_fingerprint_duplicate_is_skipped_without_external_id(self):
+        path = self.write_csv("repeat_no_id.csv", [
+            ["Date", "Description", "Amount"],
+            ["08/02/2026", "COFFEE SHOP", "-5.25"],
+        ])
+
         app.import_csv_transactions(path, self.account_id)
-        app.import_csv_transactions(path, self.account_id)
+        inserted, duplicates, errors = app.import_csv_transactions(path, self.account_id)
+        self.assertEqual((inserted, duplicates, errors), (0, 1, []))
+        self.assertEqual(app.get_transaction_count(self.account_id), 1)
+
+    def test_identical_legitimate_rows_are_preserved(self):
+        path = self.write_csv("same_day.csv", [
+            ["Date", "Description", "Amount"],
+            ["08/03/2026", "PARKING", "-10.00"],
+            ["08/03/2026", "PARKING", "-10.00"],
+        ])
+
+        first = app.import_csv_transactions(path, self.account_id)
+        second = app.import_csv_transactions(path, self.account_id)
+        self.assertEqual(first[:2], (2, 0))
+        self.assertEqual(second[:2], (0, 2))
         self.assertEqual(app.get_transaction_count(self.account_id), 2)
+
+    def test_existing_pre_commit_rows_are_backfilled(self):
+        conn = sqlite3.connect(app.DB_PATH)
+        conn.execute(
+            """INSERT INTO transactions(
+                   account_id, transaction_date, description, amount, source
+               ) VALUES (?, ?, ?, ?, 'csv')""",
+            (self.account_id, "2026-08-04", "BOOK STORE", -20.0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-running init_db simulates opening a database created before Commit 3.
+        app.init_db()
+        path = self.write_csv("legacy.csv", [
+            ["Date", "Description", "Amount"],
+            ["08/04/2026", "BOOK STORE", "-20.00"],
+        ])
+        inserted, duplicates, _ = app.import_csv_transactions(path, self.account_id)
+        self.assertEqual((inserted, duplicates), (0, 1))
+        self.assertEqual(app.get_transaction_count(self.account_id), 1)
 
 
 if __name__ == "__main__":
