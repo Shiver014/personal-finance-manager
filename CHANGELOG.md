@@ -31,6 +31,24 @@ All notable changes to the Personal Finance Manager are documented here.
 
 ## [Unreleased]
 
+### Update 2 - Commit 5: Transactions Viewer & Filtering
+
+#### Added
+- Added a Transactions page to the main sidebar.
+- Added read-only browsing of normalized banking transactions with account names.
+- Added filters for account, transaction type, category, date range, and description text.
+- Added transaction summary totals for non-transfer inflows, non-transfer outflows, and transfer entries.
+- Added Reset Filters and YYYY-MM-DD date validation.
+
+#### Safety / Scope
+- The viewer is read-only; this commit does not edit or delete banking transactions.
+- Confirmed transfers remain excluded from inflow/outflow summary totals.
+- Existing CSV import, duplicate detection, and transfer handling behavior is preserved.
+
+#### Tests
+- Added transaction query tests for ordering, account/type filtering, date/category/search filtering, and filter-option discovery.
+- Full automated suite: 19 tests passing.
+
 ### Update 2 - Commit 2: CSV Import Foundation
 
 #### Added

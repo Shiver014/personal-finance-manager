@@ -204,3 +204,8 @@ A commit is complete when:
 The recovered `finance_data.db` is now the application database. It remains ignored by Git. Development and migration tests should be run against copies or sandbox databases rather than intentionally modifying the production database.
 
 
+
+
+## Update 2 - Commit 5
+
+Added a read-only Transactions Viewer with account, type, category, date-range, and description filtering. Summary totals exclude confirmed transfer entries from inflow/outflow calculations.

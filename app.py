@@ -323,6 +323,59 @@ def get_transaction_count(account_id=None):
     return count
 
 
+def get_transaction_filter_options():
+    """Return distinct categories/types used by the transaction viewer."""
+    conn = get_conn()
+    try:
+        categories = [r[0] for r in conn.execute(
+            "SELECT DISTINCT category FROM transactions WHERE category IS NOT NULL AND TRIM(category) <> '' ORDER BY category"
+        ).fetchall()]
+        types = [r[0] for r in conn.execute(
+            "SELECT DISTINCT transaction_type FROM transactions WHERE transaction_type IS NOT NULL AND TRIM(transaction_type) <> '' ORDER BY transaction_type"
+        ).fetchall()]
+        return categories, types
+    finally:
+        conn.close()
+
+
+def get_filtered_transactions(account_id=None, transaction_type=None, category=None,
+                              date_from=None, date_to=None, search_text=None):
+    """Return normalized transactions joined to account names using optional filters."""
+    sql = """
+        SELECT t.id, t.transaction_date, a.institution, a.account_name,
+               t.description, t.amount, t.category, t.transaction_type,
+               t.source, t.linked_transaction_id
+        FROM transactions t
+        JOIN accounts a ON a.id = t.account_id
+        WHERE 1=1
+    """
+    params = []
+    if account_id is not None:
+        sql += " AND t.account_id = ?"
+        params.append(account_id)
+    if transaction_type:
+        sql += " AND t.transaction_type = ?"
+        params.append(transaction_type)
+    if category:
+        sql += " AND t.category = ?"
+        params.append(category)
+    if date_from:
+        sql += " AND t.transaction_date >= ?"
+        params.append(date_from)
+    if date_to:
+        sql += " AND t.transaction_date <= ?"
+        params.append(date_to)
+    if search_text:
+        sql += " AND LOWER(t.description) LIKE ?"
+        params.append(f"%{search_text.strip().lower()}%")
+    sql += " ORDER BY t.transaction_date DESC, t.id DESC"
+
+    conn = get_conn()
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
 def get_transfer_candidates(max_days=3):
     """Return conservative, one-to-one transfer candidates between owned accounts.
 
@@ -2163,6 +2216,157 @@ class CSVImportDialog(tk.Toplevel):
             self.on_import()
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TRANSACTIONS VIEWER
+# ═════════════════════════════════════════════════════════════════════════════
+class TransactionsTab(tk.Frame):
+    """Read-only browser for normalized banking transactions."""
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self.account_map = {}
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=28, pady=(26, 10))
+        tk.Label(header, text="Transactions", bg=BG, fg=TEXT, font=FONT_H1).pack(side="left")
+        styled_btn(header, "Reset Filters", self._reset_filters, color=ACCENT5).pack(side="right")
+
+        filters = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        filters.pack(fill="x", padx=28, pady=(0, 12))
+
+        row1 = tk.Frame(filters, bg=BG2)
+        row1.pack(fill="x", padx=12, pady=(10, 5))
+        tk.Label(row1, text="Account", bg=BG2, fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+        self.account_var = tk.StringVar(value="All Accounts")
+        self.account_combo = ttk.Combobox(row1, textvariable=self.account_var, state="readonly", width=30)
+        self.account_combo.pack(side="left", padx=(6, 14))
+
+        tk.Label(row1, text="Type", bg=BG2, fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+        self.type_var = tk.StringVar(value="All Types")
+        self.type_combo = ttk.Combobox(row1, textvariable=self.type_var, state="readonly", width=18)
+        self.type_combo.pack(side="left", padx=(6, 14))
+
+        tk.Label(row1, text="Category", bg=BG2, fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+        self.category_var = tk.StringVar(value="All Categories")
+        self.category_combo = ttk.Combobox(row1, textvariable=self.category_var, state="readonly", width=20)
+        self.category_combo.pack(side="left", padx=(6, 0))
+
+        row2 = tk.Frame(filters, bg=BG2)
+        row2.pack(fill="x", padx=12, pady=(5, 10))
+        tk.Label(row2, text="From (YYYY-MM-DD)", bg=BG2, fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+        self.from_var = tk.StringVar()
+        tk.Entry(row2, textvariable=self.from_var, width=12, bg=BG3, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", font=FONT_BODY).pack(side="left", padx=(6, 14), ipady=3)
+        tk.Label(row2, text="To", bg=BG2, fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+        self.to_var = tk.StringVar()
+        tk.Entry(row2, textvariable=self.to_var, width=12, bg=BG3, fg=TEXT, insertbackground=TEXT,
+                 relief="flat", font=FONT_BODY).pack(side="left", padx=(6, 14), ipady=3)
+        tk.Label(row2, text="Description", bg=BG2, fg=TEXT_DIM, font=FONT_SMALL).pack(side="left")
+        self.search_var = tk.StringVar()
+        search = tk.Entry(row2, textvariable=self.search_var, width=28, bg=BG3, fg=TEXT, insertbackground=TEXT,
+                          relief="flat", font=FONT_BODY)
+        search.pack(side="left", padx=(6, 10), ipady=3)
+        styled_btn(row2, "Apply", self._apply_filters, color=ACCENT, fg=BG).pack(side="left")
+        search.bind("<Return>", lambda e: self._apply_filters())
+
+        self.summary = tk.Label(self, text="", bg=BG, fg=TEXT_DIM, font=FONT_BODY, anchor="w")
+        self.summary.pack(fill="x", padx=30, pady=(0, 10))
+
+        card = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=28, pady=(0, 28))
+        cols = ("date", "account", "description", "amount", "category", "type", "source")
+        self.tree = ttk.Treeview(card, columns=cols, show="headings", height=18)
+        specs = (
+            ("date", "Date", 95, "w"), ("account", "Account", 180, "w"),
+            ("description", "Description", 310, "w"), ("amount", "Amount", 105, "e"),
+            ("category", "Category", 120, "w"), ("type", "Type", 110, "w"),
+            ("source", "Source", 75, "w"),
+        )
+        for col, heading, width, anchor in specs:
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=width, anchor=anchor)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        scroll = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
+        scroll.pack(side="right", fill="y", padx=(0, 8), pady=8)
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        for var in (self.account_var, self.type_var, self.category_var):
+            var.trace_add("write", lambda *_: self.after_idle(self._apply_filters))
+
+    @staticmethod
+    def _valid_iso_date(value):
+        if not value:
+            return True
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    def refresh(self):
+        accounts = get_accounts(active_only=False)
+        self.account_map = {f"{r[1]} — {r[2]}": r[0] for r in accounts}
+        self.account_combo["values"] = ["All Accounts"] + list(self.account_map.keys())
+        if self.account_var.get() not in self.account_combo["values"]:
+            self.account_var.set("All Accounts")
+
+        categories, types = get_transaction_filter_options()
+        self.type_combo["values"] = ["All Types"] + types
+        self.category_combo["values"] = ["All Categories"] + categories
+        if self.type_var.get() not in self.type_combo["values"]:
+            self.type_var.set("All Types")
+        if self.category_var.get() not in self.category_combo["values"]:
+            self.category_var.set("All Categories")
+        self._apply_filters()
+
+    def _apply_filters(self):
+        date_from = self.from_var.get().strip()
+        date_to = self.to_var.get().strip()
+        if not self._valid_iso_date(date_from) or not self._valid_iso_date(date_to):
+            self.summary.configure(text="Use YYYY-MM-DD for date filters.", fg=ACCENT2)
+            return
+        if date_from and date_to and date_from > date_to:
+            self.summary.configure(text="The From date must be on or before the To date.", fg=ACCENT2)
+            return
+
+        account_id = self.account_map.get(self.account_var.get())
+        tx_type = None if self.type_var.get() == "All Types" else self.type_var.get()
+        category = None if self.category_var.get() == "All Categories" else self.category_var.get()
+        rows = get_filtered_transactions(
+            account_id=account_id, transaction_type=tx_type, category=category,
+            date_from=date_from or None, date_to=date_to or None,
+            search_text=self.search_var.get().strip() or None,
+        )
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for r in rows:
+            account_label = f"{r[2]} — {r[3]}"
+            self.tree.insert("", "end", iid=str(r[0]), values=(
+                r[1], account_label, r[4], fmt_money(r[5]), r[6] or "—",
+                r[7] or "uncategorized", r[8] or "—",
+            ))
+
+        inflow = sum(float(r[5]) for r in rows if float(r[5]) > 0 and r[7] != "transfer")
+        outflow = sum(-float(r[5]) for r in rows if float(r[5]) < 0 and r[7] != "transfer")
+        transfers = sum(1 for r in rows if r[7] == "transfer")
+        self.summary.configure(
+            text=(f"{len(rows)} transaction(s)  •  Non-transfer inflow: {fmt_money(inflow)}"
+                  f"  •  Non-transfer outflow: {fmt_money(outflow)}  •  Transfer entries: {transfers}"),
+            fg=TEXT_DIM,
+        )
+
+    def _reset_filters(self):
+        self.account_var.set("All Accounts")
+        self.type_var.set("All Types")
+        self.category_var.set("All Categories")
+        self.from_var.set("")
+        self.to_var.set("")
+        self.search_var.set("")
+        self._apply_filters()
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SIDEBAR NAV
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2171,6 +2375,7 @@ SIDEBAR_W = 200
 NAV_ITEMS = [
     ("Dashboard", "💰", ACCENT),
     ("Accounts",  "🏦", ACCENT3),
+    ("Transactions", "📋", ACCENT4),
     ("Income",    "📥", ACCENT),
     ("Expenses",  "📤", ACCENT2),
     ("Recurring", "🔁", ACCENT5),
@@ -2232,6 +2437,7 @@ class App(tk.Tk):
         # ── Build all pages ───────────────────────────────────────────────
         self.dash = DashboardTab(self.content)
         self.acct = AccountsTab(self.content,        self._refresh)
+        self.txn  = TransactionsTab(self.content)
         self.inc  = IncomeTab(self.content,          self._refresh)
         self.exp  = CombinedExpensesTab(self.content, self._refresh)
         self.rec  = RecurringTab(self.content,        self._refresh)
@@ -2239,6 +2445,7 @@ class App(tk.Tk):
         self._pages = {
             "Dashboard": self.dash,
             "Accounts":  self.acct,
+            "Transactions": self.txn,
             "Income":    self.inc,
             "Expenses":  self.exp,
             "Recurring": self.rec,
@@ -2330,6 +2537,8 @@ class App(tk.Tk):
 
     def _refresh(self):
         self.dash.refresh()
+        self.acct.refresh()
+        self.txn.refresh()
 
 if __name__ == "__main__":
     App().mainloop()

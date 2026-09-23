@@ -6,13 +6,14 @@
 - [x] SQLite persistence
 - [x] Accounts table
 - [x] Initial Accounts data-access functions
-- [ ] Accounts management UI
-- [ ] Account deactivation
-- [ ] Transaction-to-account relationships
+- [x] Accounts management UI
+- [x] Account deactivation
+- [x] Transaction-to-account relationships
 - [ ] Addition Financial CSV import profile
 - [ ] SoFi Checking/Savings CSV import profile
 - [x] Duplicate transaction detection
-- [ ] Transfer handling
+- [x] Transfer handling
+- [x] Transaction viewer and filtering
 - [ ] Account reconciliation
 
 ## Version 0.2 - Budgeting

@@ -113,3 +113,8 @@ See:
 - `docs/database.md` for the database model
 - `docs/roadmap.md` for planned features
 - `docs/decisions.md` for important design decisions
+
+
+## Current Banking Features
+
+The banking foundation includes account management, normalized CSV transaction imports, duplicate protection, confirmed internal-transfer handling, and a read-only Transactions Viewer with account/type/category/date/description filters.
