@@ -106,6 +106,21 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_transactions_external_id
         ON transactions(account_id, external_id);
 
+    -- Account reconciliation snapshots preserve bank-confirmed balances over time.
+    CREATE TABLE IF NOT EXISTS account_reconciliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL,
+        reconciliation_date TEXT NOT NULL,
+        bank_balance REAL NOT NULL,
+        expected_balance REAL,
+        difference REAL,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(account_id) REFERENCES accounts(id));
+
+    CREATE INDEX IF NOT EXISTS idx_reconciliations_account_date
+        ON account_reconciliations(account_id, reconciliation_date);
+
     -- Recurring schedules table
     -- type: 'paycheck' | 'expense' | 'loan_payment'
     -- frequency: 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'yearly'
@@ -246,6 +261,87 @@ def get_accounts(active_only=True):
         ).fetchall()
     conn.close()
     return rows
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ACCOUNT RECONCILIATION DATA ACCESS
+# ═════════════════════════════════════════════════════════════════════════════
+def get_latest_reconciliation(account_id):
+    """Return the latest bank-confirmed reconciliation snapshot for an account."""
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT id, account_id, reconciliation_date, bank_balance, expected_balance,
+                  difference, note, created_at
+           FROM account_reconciliations
+           WHERE account_id=?
+           ORDER BY reconciliation_date DESC, id DESC LIMIT 1""",
+        (account_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_reconciliation_history(account_id):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, reconciliation_date, bank_balance, expected_balance, difference, note
+           FROM account_reconciliations WHERE account_id=?
+           ORDER BY reconciliation_date DESC, id DESC""",
+        (account_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def calculate_expected_balance(account_id, reconciliation_date):
+    """Project balance from the prior reconciliation through the supplied date.
+
+    Returns None when there is no earlier reconciliation baseline. All signed
+    transactions count, including transfers, because they change an individual
+    account's cash balance.
+    """
+    conn = get_conn()
+    prior = conn.execute(
+        """SELECT reconciliation_date, bank_balance FROM account_reconciliations
+           WHERE account_id=? AND reconciliation_date < ?
+           ORDER BY reconciliation_date DESC, id DESC LIMIT 1""",
+        (account_id, reconciliation_date),
+    ).fetchone()
+    if not prior:
+        conn.close()
+        return None
+    activity = conn.execute(
+        """SELECT COALESCE(SUM(amount),0) FROM transactions
+           WHERE account_id=? AND transaction_date > ? AND transaction_date <= ?""",
+        (account_id, prior[0], reconciliation_date),
+    ).fetchone()[0]
+    conn.close()
+    return float(prior[1]) + float(activity or 0)
+
+
+def save_reconciliation(account_id, reconciliation_date, bank_balance, note=""):
+    """Save a bank-confirmed balance snapshot and return its variance, if measurable."""
+    date.fromisoformat(reconciliation_date)
+    expected = calculate_expected_balance(account_id, reconciliation_date)
+    difference = None if expected is None else float(bank_balance) - expected
+    conn = get_conn()
+    try:
+        conn.execute(
+            """INSERT INTO account_reconciliations
+               (account_id, reconciliation_date, bank_balance, expected_balance, difference, note)
+               VALUES (?,?,?,?,?,?)""",
+            (account_id, reconciliation_date, float(bank_balance), expected, difference, note.strip()),
+        )
+        # current_balance remains the most recently bank-confirmed balance.
+        conn.execute("UPDATE accounts SET current_balance=? WHERE id=?",
+                     (float(bank_balance), account_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return expected, difference
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS DATA ACCESS
@@ -1904,6 +2000,74 @@ class TransferReviewDialog(tk.Toplevel):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ACCOUNT RECONCILIATION UI
+# ═════════════════════════════════════════════════════════════════════════════
+class ReconciliationDialog(tk.Toplevel):
+    def __init__(self, parent, account, on_save=None):
+        super().__init__(parent)
+        self.account = account
+        self.on_save = on_save
+        self.title("Reconcile Account")
+        self.configure(bg=BG)
+        self.geometry("650x520")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        label = f"{account[1]} — {account[2]}"
+        tk.Label(self, text="Reconcile Account", bg=BG, fg=ACCENT4, font=FONT_H2).pack(pady=(18,4))
+        tk.Label(self, text=label, bg=BG, fg=TEXT, font=FONT_BODY).pack(pady=(0,14))
+
+        body = tk.Frame(self, bg=BG); body.pack(fill="x", padx=28)
+        self.date_e = _dlg_row(body, "Bank balance as of", today_str())
+        self.balance_e = _dlg_row(body, "Bank balance ($)", account[5] or 0)
+        self.note_e = _dlg_row(body, "Note (optional)")
+
+        info = tk.Label(self, bg=BG, fg=TEXT_DIM, font=FONT_SMALL, justify="left", anchor="w")
+        latest = get_latest_reconciliation(account[0])
+        if latest:
+            info.config(text=f"Last reconciled: {latest[2]} at {fmt_money(latest[3])}\nA new reconciliation compares transaction activity since that snapshot.")
+        else:
+            info.config(text="First reconciliation: this creates the starting bank-confirmed balance.\nVariance becomes available after a prior reconciliation exists.")
+        info.pack(fill="x", padx=28, pady=12)
+
+        styled_btn(self, "Save Reconciliation", self._save, color=ACCENT4, fg=BG).pack(pady=(0,14))
+
+        hist = section_card(self, "Reconciliation History")
+        hist.pack(fill="both", expand=True, padx=28, pady=(0,20))
+        self.tree = make_tree(hist, ("Date","Bank Balance","Expected","Difference"), (110,130,130,130), height=6)
+        self.tree.pack(fill="both", expand=True, padx=12, pady=(0,12))
+        for row in get_reconciliation_history(account[0]):
+            _, d, bank, expected, diff, note = row
+            self.tree.insert("", "end", values=(
+                d, fmt_money(bank), "—" if expected is None else fmt_money(expected),
+                "—" if diff is None else fmt_money(diff)))
+
+    def _save(self):
+        ds = self.date_e.get().strip()
+        try:
+            date.fromisoformat(ds)
+        except ValueError:
+            messagebox.showerror("Invalid Date", "Use YYYY-MM-DD.", parent=self); return
+        try:
+            balance = float(self.balance_e.get().replace(",", "").replace("$", "").strip())
+        except ValueError:
+            messagebox.showerror("Invalid Balance", "Enter a valid bank balance.", parent=self); return
+        try:
+            expected, difference = save_reconciliation(self.account[0], ds, balance, self.note_e.get())
+        except Exception as exc:
+            messagebox.showerror("Reconciliation Error", str(exc), parent=self); return
+        if expected is None:
+            msg = f"Starting reconciliation saved at {fmt_money(balance)}."
+        else:
+            msg = (f"Bank balance: {fmt_money(balance)}\nExpected from prior reconciliation: {fmt_money(expected)}\n"
+                   f"Difference: {fmt_money(difference)}")
+        messagebox.showinfo("Reconciliation Saved", msg, parent=self)
+        self.destroy()
+        if self.on_save: self.on_save()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ACCOUNTS UI
 # ═════════════════════════════════════════════════════════════════════════════
 ACCOUNT_TYPES = ["Checking", "Savings", "Savings Plus", "Roth IRA", "Stocks"]
@@ -1992,6 +2156,7 @@ class AccountsTab(tk.Frame):
         styled_btn(header, "+ Add Account", self._add, color=ACCENT3, fg=BG).pack(side="right")
         styled_btn(header, "Import CSV", self._import_csv, color=ACCENT4, fg=BG).pack(side="right", padx=(0, 8))
         styled_btn(header, "Review Transfers", self._review_transfers, color=ACCENT5, fg=BG).pack(side="right", padx=(0, 8))
+        styled_btn(header, "Reconcile", self._reconcile, color=ACCENT, fg=BG).pack(side="right", padx=(0, 8))
 
         self.summary = tk.Label(self, text="", bg=BG, fg=TEXT_DIM, font=FONT_BODY, anchor="w")
         self.summary.pack(fill="x", padx=30, pady=(0, 12))
@@ -2061,6 +2226,19 @@ class AccountsTab(tk.Frame):
         new_state = not bool(account[7])
         set_account_active(account[0], new_state)
         self._changed()
+
+    def _reconcile(self):
+        account = self._selected()
+        if not account:
+            return
+        if account[3] in ("Roth IRA", "Stocks"):
+            messagebox.showinfo(
+                "Investment Account",
+                "Roth IRA and stock accounts will use investment/market-value reconciliation in Update 4.",
+                parent=self,
+            )
+            return
+        ReconciliationDialog(self, account, on_save=self._changed)
 
     def _review_transfers(self):
         TransferReviewDialog(self, on_change=self._changed)
