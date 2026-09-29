@@ -117,6 +117,24 @@ transactions.transaction_type = category_type (`expense` or `income`)
 
 Confirmed internal transfers cannot be reclassified through category assignment. Clearing a normal category resets the row to `category=NULL` and `transaction_type='uncategorized'`. Renaming a canonical category also updates normalized transaction rows already using that category name.
 
+
+## Budget-vs-Actual Reporting
+
+Update 3 - Commit 2 does not add another persistence table. It derives the monthly report from the existing canonical categories, `monthly_budgets`, and normalized `transactions`.
+
+For a selected month and expense category:
+
+```text
+actual spend = -SUM(normalized transaction amounts classified as expense)
+remaining    = planned budget - actual spend
+```
+
+Because expense-category actuals use the signed transaction ledger, a positive expense-category refund reduces net spending. Confirmed transfers are excluded because they use `transaction_type='transfer'`. Legacy `expenses` and `paychecks` rows are not merged into these actuals.
+
+Negative normalized transactions that are still uncategorized are reported separately as **Uncategorized Outflow**. This amount is intentionally not assigned to a budget category until the user categorizes those transactions.
+
+Removing a monthly budget deletes only the plan for that category/month. It does not delete or alter transaction history.
+
 ## Existing Legacy/Application Tables
 
 ### `paychecks`

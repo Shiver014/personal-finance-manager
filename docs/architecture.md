@@ -33,6 +33,7 @@ The application is still a single Python module. A module split is deferred unti
 - Transaction browsing/filtering
 - Account reconciliation
 - Budget/category data model
+- Monthly budget planning and budget-vs-actual reporting
 - Transaction category management
 - Dashboard
 - Income/paychecks
@@ -79,6 +80,8 @@ Budgeting / Categories
   assign_transaction_category()
   set_monthly_budget()
   get_monthly_budgets()
+  delete_monthly_budget()
+  get_budget_report()
 ```
 
 ## Banking Data Flow
@@ -138,6 +141,7 @@ Current sidebar pages are:
 Dashboard
 Accounts
 Transactions
+Budget
 Income
 Expenses
 Recurring
@@ -162,6 +166,8 @@ legacy paychecks / expenses
 ```
 
 A category has an explicit `expense` or `income` type. Assigning a category to a normalized transaction also sets that transaction's classification to the category type. Transfers are excluded from this model and continue to use the transfer workflow.
+
+Update 3 - Commit 2 adds a dedicated Budget page. The page navigates month-by-month, edits monthly category plans, and compares them with actual normalized transaction activity. Actual spending is calculated from `transactions` rows classified as `expense`; confirmed transfers and the legacy `paychecks`/`expenses` tables remain excluded. Uncategorized negative banking transactions are surfaced separately so incomplete categorization cannot silently make the budget appear healthier than the underlying bank activity.
 
 ## Future Direction
 

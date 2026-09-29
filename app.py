@@ -640,6 +640,111 @@ def delete_monthly_budget(budget_id):
         conn.close()
 
 
+def get_budget_report(budget_month):
+    """Return monthly budget-vs-actual rows and summary totals.
+
+    Actual spending comes only from normalized transactions classified as
+    ``expense``. Confirmed transfers and the legacy ``expenses`` table are not
+    included. Positive expense-category activity (for example, a refund)
+    reduces net actual spending for that category.
+    """
+    month = normalize_budget_month(budget_month)
+    start = date.fromisoformat(month)
+    if start.month == 12:
+        end = date(start.year + 1, 1, 1)
+    else:
+        end = date(start.year, start.month + 1, 1)
+    end_text = end.isoformat()
+
+    conn = get_conn()
+    try:
+        raw_rows = conn.execute(
+            """
+            SELECT c.id, c.name, c.is_active,
+                   b.id, COALESCE(b.amount, 0), COALESCE(b.note, ''),
+                   COALESCE(SUM(-t.amount), 0) AS actual_spend
+            FROM budget_categories c
+            LEFT JOIN monthly_budgets b
+              ON b.category_id=c.id AND b.budget_month=?
+            LEFT JOIN transactions t
+              ON LOWER(TRIM(COALESCE(t.category,''))) = LOWER(TRIM(c.name))
+             AND t.transaction_type='expense'
+             AND t.transaction_date >= ? AND t.transaction_date < ?
+            WHERE c.category_type='expense'
+            GROUP BY c.id, c.name, c.is_active, b.id, b.amount, b.note
+            HAVING c.is_active=1 OR b.id IS NOT NULL OR ABS(COALESCE(SUM(t.amount),0)) > 0.000001
+            ORDER BY c.name COLLATE NOCASE
+            """,
+            (month, month, end_text),
+        ).fetchall()
+
+        uncategorized_row = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END), 0)
+            FROM transactions
+            WHERE transaction_date >= ? AND transaction_date < ?
+              AND COALESCE(transaction_type, 'uncategorized') != 'transfer'
+              AND amount < 0
+              AND (category IS NULL OR TRIM(category)=''
+                   OR COALESCE(transaction_type, 'uncategorized')='uncategorized')
+            """,
+            (month, end_text),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    rows = []
+    planned_total = 0.0
+    actual_total = 0.0
+    for category_id, name, is_active, budget_id, budget_amount, note, actual in raw_rows:
+        budget_amount = float(budget_amount or 0)
+        actual = float(actual or 0)
+        has_budget = budget_id is not None
+        planned_total += budget_amount if has_budget else 0.0
+        actual_total += actual
+
+        if not has_budget:
+            remaining = None
+            percent_used = None
+            status = "No budget"
+        else:
+            remaining = budget_amount - actual
+            if budget_amount > 0:
+                percent_used = (actual / budget_amount) * 100
+            else:
+                percent_used = 0.0 if abs(actual) < 0.000001 else None
+
+            if actual > budget_amount + 0.005:
+                status = "Over budget"
+            elif budget_amount > 0 and abs(actual - budget_amount) <= 0.005:
+                status = "At limit"
+            else:
+                status = "On track"
+
+        rows.append({
+            "category_id": int(category_id),
+            "category_name": name,
+            "is_active": bool(is_active),
+            "budget_id": int(budget_id) if budget_id is not None else None,
+            "budget_amount": budget_amount,
+            "note": note or "",
+            "actual_spend": actual,
+            "remaining": remaining,
+            "percent_used": percent_used,
+            "status": status,
+        })
+
+    return {
+        "budget_month": month,
+        "rows": rows,
+        "planned_total": planned_total,
+        "actual_total": actual_total,
+        "remaining_total": planned_total - actual_total,
+        "uncategorized_count": int(uncategorized_row[0] or 0),
+        "uncategorized_outflow": float(uncategorized_row[1] or 0),
+    }
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS DATA ACCESS
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2857,12 +2962,232 @@ class CategoryAssignmentDialog(tk.Toplevel):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# BUDGET PLANNING / REPORTING UI
+# ═════════════════════════════════════════════════════════════════════════════
+class BudgetEditDialog(tk.Toplevel):
+    def __init__(self, parent, category, budget_month, existing=None, on_save=None):
+        super().__init__(parent)
+        self.category = category
+        self.budget_month = normalize_budget_month(budget_month)
+        self.existing = existing
+        self.on_save = on_save
+        self.title("Monthly Budget")
+        self.configure(bg=BG)
+        self.geometry("470x330")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        tk.Label(self, text="Monthly Budget", bg=BG, fg=ACCENT, font=FONT_H2).pack(pady=(18,4))
+        tk.Label(self, text=category[1], bg=BG, fg=TEXT, font=FONT_BODY).pack()
+        month_label = date.fromisoformat(self.budget_month).strftime("%B %Y")
+        tk.Label(self, text=month_label, bg=BG, fg=TEXT_DIM, font=FONT_SMALL).pack(pady=(2,14))
+
+        current_amount = existing["budget_amount"] if existing and existing["budget_id"] is not None else ""
+        current_note = existing["note"] if existing else ""
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="x", padx=28)
+        self.amount_e = _dlg_row(body, "Budget Amount ($)", current_amount)
+        self.note_e = _dlg_row(body, "Note (optional)", current_note)
+
+        tk.Label(
+            self,
+            text="Actual spending is calculated from categorized normalized transactions.",
+            bg=BG, fg=TEXT_DIM, font=FONT_SMALL, wraplength=390, justify="left",
+        ).pack(fill="x", padx=28, pady=(12,4))
+
+        styled_btn(self, "Save Budget", self._save, color=ACCENT, fg=BG).pack(pady=14)
+
+    def _save(self):
+        try:
+            amount = float(self.amount_e.get().replace(",", "").replace("$", "").strip())
+        except ValueError:
+            messagebox.showerror("Invalid Budget", "Enter a valid budget amount.", parent=self)
+            return
+        try:
+            set_monthly_budget(self.category[0], self.budget_month, amount, self.note_e.get())
+        except Exception as exc:
+            messagebox.showerror("Budget Error", str(exc), parent=self)
+            return
+        self.destroy()
+        if self.on_save:
+            self.on_save()
+
+
+class BudgetTab(tk.Frame):
+    """Monthly budget planner backed by normalized transaction actuals."""
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        today = date.today()
+        self.current_month = today.replace(day=1)
+        self.row_map = {}
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=28, pady=(24,10))
+        tk.Label(header, text="Budget", bg=BG, fg=TEXT, font=FONT_H1).pack(side="left")
+        styled_btn(header, "Manage Categories", self._manage_categories, color=ACCENT4, fg=BG).pack(side="right")
+
+        monthbar = tk.Frame(self, bg=BG)
+        monthbar.pack(fill="x", padx=28, pady=(0,10))
+        styled_btn(monthbar, "‹ Previous", self._previous_month, color=BORDER, fg=TEXT).pack(side="left")
+        styled_btn(monthbar, "This Month", self._this_month, color=ACCENT5, fg=BG).pack(side="left", padx=8)
+        styled_btn(monthbar, "Next ›", self._next_month, color=BORDER, fg=TEXT).pack(side="left")
+        self.month_lbl = tk.Label(monthbar, text="", bg=BG, fg=ACCENT, font=FONT_H2)
+        self.month_lbl.pack(side="right")
+
+        self.summary_frame = tk.Frame(self, bg=BG)
+        self.summary_frame.pack(fill="x", padx=28, pady=(0,12))
+        self.summary_frame.columnconfigure((0,1,2,3), weight=1)
+        self.summary_labels = {}
+        for idx, (key, title, clr) in enumerate((
+            ("planned", "PLANNED", ACCENT4),
+            ("actual", "CATEGORIZED SPEND", ACCENT2),
+            ("remaining", "REMAINING", ACCENT),
+            ("uncategorized", "UNCATEGORIZED OUTFLOW", ACCENT3),
+        )):
+            card = tk.Frame(self.summary_frame, bg=BG3, highlightthickness=1, highlightbackground=BORDER)
+            card.grid(row=0, column=idx, sticky="nsew", padx=4, ipady=8)
+            tk.Label(card, text=title, bg=BG3, fg=TEXT_DIM, font=FONT_SMALL).pack(pady=(8,2))
+            value = tk.Label(card, text="$0.00", bg=BG3, fg=clr, font=("Times New Roman", 16, "bold"))
+            value.pack()
+            self.summary_labels[key] = value
+            if key == "uncategorized":
+                count = tk.Label(card, text="0 transaction(s)", bg=BG3, fg=TEXT_DIM, font=FONT_SMALL)
+                count.pack(pady=(2,8))
+                self.summary_labels["uncategorized_count"] = count
+            else:
+                tk.Frame(card, bg=BG3, height=18).pack()
+
+        info = tk.Label(
+            self,
+            text=("Actuals use categorized normalized transactions whose transaction date falls inside the selected month. "
+                  "Confirmed transfers and legacy paychecks/expenses are not counted. Uncategorized bank outflow is shown separately."),
+            bg=BG, fg=TEXT_DIM, font=FONT_SMALL, anchor="w", justify="left",
+        )
+        info.pack(fill="x", padx=30, pady=(0,8))
+
+        card = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=28, pady=(0,10))
+        cols = ("category", "budget", "actual", "remaining", "used", "status")
+        self.tree = ttk.Treeview(card, columns=cols, show="headings", height=15, selectmode="browse")
+        specs = (
+            ("category", "Category", 220, "w"),
+            ("budget", "Budget", 120, "e"),
+            ("actual", "Actual", 120, "e"),
+            ("remaining", "Remaining", 120, "e"),
+            ("used", "Used", 90, "e"),
+            ("status", "Status", 130, "w"),
+        )
+        for col, title, width, anchor in specs:
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, anchor=anchor)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(8,0), pady=8)
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
+        sb.pack(side="right", fill="y", padx=(0,8), pady=8)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<Double-1>", lambda _e: self._edit_selected())
+
+        controls = tk.Frame(self, bg=BG)
+        controls.pack(fill="x", padx=28, pady=(0,18))
+        styled_btn(controls, "Set / Edit Selected", self._edit_selected, color=ACCENT, fg=BG).pack(side="left")
+        styled_btn(controls, "Remove Budget", self._remove_selected, color=ACCENT2, fg=TEXT).pack(side="left", padx=8)
+        styled_btn(controls, "Refresh", self.refresh, color=BORDER, fg=TEXT).pack(side="right")
+
+    def _month_text(self):
+        return self.current_month.isoformat()
+
+    def refresh(self):
+        report = get_budget_report(self._month_text())
+        self.month_lbl.configure(text=self.current_month.strftime("%B %Y"))
+        self.summary_labels["planned"].configure(text=fmt_money(report["planned_total"]))
+        self.summary_labels["actual"].configure(text=fmt_money(report["actual_total"]))
+        self.summary_labels["remaining"].configure(
+            text=fmt_money(report["remaining_total"]),
+            fg=ACCENT if report["remaining_total"] >= 0 else ACCENT2,
+        )
+        self.summary_labels["uncategorized"].configure(text=fmt_money(report["uncategorized_outflow"]))
+        self.summary_labels["uncategorized_count"].configure(
+            text=f"{report['uncategorized_count']} transaction(s)"
+        )
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.row_map = {}
+        for row in report["rows"]:
+            self.row_map[row["category_id"]] = row
+            budget_text = "—" if row["budget_id"] is None else fmt_money(row["budget_amount"])
+            remaining_text = "—" if row["remaining"] is None else fmt_money(row["remaining"])
+            used_text = "—" if row["percent_used"] is None else f"{row['percent_used']:.0f}%"
+            category_text = row["category_name"] + (" (inactive)" if not row["is_active"] else "")
+            self.tree.insert("", "end", iid=str(row["category_id"]), values=(
+                category_text, budget_text, fmt_money(row["actual_spend"]),
+                remaining_text, used_text, row["status"],
+            ))
+
+    def _selected_row(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Select Category", "Select a budget category first.", parent=self)
+            return None
+        return self.row_map.get(int(selected[0]))
+
+    def _edit_selected(self):
+        row = self._selected_row()
+        if not row:
+            return
+        category = (row["category_id"], row["category_name"])
+        BudgetEditDialog(self, category, self._month_text(), existing=row, on_save=self.refresh)
+
+    def _remove_selected(self):
+        row = self._selected_row()
+        if not row:
+            return
+        if row["budget_id"] is None:
+            messagebox.showinfo("No Budget", "This category does not have a saved budget for the selected month.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Remove Budget",
+            f"Remove the {self.current_month.strftime('%B %Y')} budget for {row['category_name']}?",
+            parent=self,
+        ):
+            return
+        delete_monthly_budget(row["budget_id"])
+        self.refresh()
+
+    def _manage_categories(self):
+        CategoryManagerDialog(self, on_change=self.refresh)
+
+    def _previous_month(self):
+        if self.current_month.month == 1:
+            self.current_month = date(self.current_month.year - 1, 12, 1)
+        else:
+            self.current_month = date(self.current_month.year, self.current_month.month - 1, 1)
+        self.refresh()
+
+    def _next_month(self):
+        if self.current_month.month == 12:
+            self.current_month = date(self.current_month.year + 1, 1, 1)
+        else:
+            self.current_month = date(self.current_month.year, self.current_month.month + 1, 1)
+        self.refresh()
+
+    def _this_month(self):
+        today = date.today()
+        self.current_month = today.replace(day=1)
+        self.refresh()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS VIEWER
 # ═════════════════════════════════════════════════════════════════════════════
 class TransactionsTab(tk.Frame):
-    """Read-only browser for normalized banking transactions."""
-    def __init__(self, parent):
+    """Browser/editor for normalized banking transaction categories."""
+    def __init__(self, parent, on_change=None):
         super().__init__(parent, bg=BG)
+        self.on_change = on_change
         self.account_map = {}
         self._build()
         self.refresh()
@@ -3005,7 +3330,7 @@ class TransactionsTab(tk.Frame):
         if not selected:
             messagebox.showinfo("Select Transactions", "Select one or more transactions first.", parent=self)
             return
-        CategoryAssignmentDialog(self, [int(i) for i in selected], on_save=self.refresh)
+        CategoryAssignmentDialog(self, [int(i) for i in selected], on_save=self._changed)
 
     def _clear_category(self):
         selected = self.tree.selection()
@@ -3023,10 +3348,17 @@ class TransactionsTab(tk.Frame):
         except Exception as exc:
             messagebox.showerror("Category Error", str(exc), parent=self)
             return
-        self.refresh()
+        self._changed()
 
     def _manage_categories(self):
-        CategoryManagerDialog(self, on_change=self.refresh)
+        CategoryManagerDialog(self, on_change=self._changed)
+
+    def _changed(self):
+        """Refresh all reports that depend on transaction categorization."""
+        if self.on_change:
+            self.on_change()
+        else:
+            self.refresh()
 
     def _reset_filters(self):
         self.account_var.set("All Accounts")
@@ -3046,6 +3378,7 @@ NAV_ITEMS = [
     ("Dashboard", "💰", ACCENT),
     ("Accounts",  "🏦", ACCENT3),
     ("Transactions", "📋", ACCENT4),
+    ("Budget",    "📊", ACCENT),
     ("Income",    "📥", ACCENT),
     ("Expenses",  "📤", ACCENT2),
     ("Recurring", "🔁", ACCENT5),
@@ -3107,7 +3440,8 @@ class App(tk.Tk):
         # ── Build all pages ───────────────────────────────────────────────
         self.dash = DashboardTab(self.content)
         self.acct = AccountsTab(self.content,        self._refresh)
-        self.txn  = TransactionsTab(self.content)
+        self.txn  = TransactionsTab(self.content, self._refresh)
+        self.budget = BudgetTab(self.content)
         self.inc  = IncomeTab(self.content,          self._refresh)
         self.exp  = CombinedExpensesTab(self.content, self._refresh)
         self.rec  = RecurringTab(self.content,        self._refresh)
@@ -3116,6 +3450,7 @@ class App(tk.Tk):
             "Dashboard": self.dash,
             "Accounts":  self.acct,
             "Transactions": self.txn,
+            "Budget":    self.budget,
             "Income":    self.inc,
             "Expenses":  self.exp,
             "Recurring": self.rec,
@@ -3202,6 +3537,10 @@ class App(tk.Tk):
         f._indicator.configure(bg=f._clr)       # coloured left bar
         f._text_lbl.configure(fg=TEXT)
 
+        # Refresh reports that depend on recently categorized/imported activity.
+        if name == "Budget":
+            self.budget.refresh()
+
         # Raise the right page
         self._pages[name].lift()
 
@@ -3209,6 +3548,7 @@ class App(tk.Tk):
         self.dash.refresh()
         self.acct.refresh()
         self.txn.refresh()
+        self.budget.refresh()
 
 if __name__ == "__main__":
     App().mainloop()

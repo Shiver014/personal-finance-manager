@@ -161,3 +161,22 @@ Future budget-vs-actual reporting should use normalized `transactions` as the so
 `monthly_budgets` stores one planned amount per expense category per month. Months are normalized to the first day (`YYYY-MM-01`) and repeated saves update the existing category/month record.
 
 Income categories are not valid monthly spending budgets. Paycheck allocation will be modeled separately in a later Update 3 commit rather than overloading the monthly expense budget table.
+
+---
+
+## ADR-015: Budget Actuals Come From Categorized Normalized Transactions
+
+**Status:** Accepted
+
+The Budget page derives actual monthly spending from the normalized `transactions` ledger, using rows classified as `expense` and matched to canonical expense categories.
+
+```text
+actual spend = -SUM(expense-classified signed amounts for the category/month)
+remaining    = monthly budget - actual spend
+```
+
+Positive expense-category activity, such as a refund, reduces net actual spending. Confirmed internal transfers remain excluded because they are classified as `transfer`.
+
+The legacy `expenses` and `paychecks` tables are not merged into budget actuals. This preserves ADR-013 and prevents duplicate counting while the application transitions toward the normalized ledger.
+
+Uncategorized negative banking transactions are displayed separately as **Uncategorized Outflow** rather than silently omitted from the user-facing summary. Removing a monthly budget removes only the plan record and never the underlying transaction history.

@@ -73,7 +73,7 @@ The project is developed incrementally using the convention **Update # - Commit 
 
 ## Update 3 - Budgeting / Allocation / Savings Goals — Current
 
-### Commit 1 - Budget Data Model & Transaction Categories — Implemented / Acceptance Testing
+### Commit 1 - Budget Data Model & Transaction Categories — Complete
 - [x] Canonical `budget_categories` table
 - [x] Seed default expense and income categories safely
 - [x] Add/edit/activate/deactivate category management
@@ -85,10 +85,23 @@ The project is developed incrementally using the convention **Update # - Commit 
 - [x] Normalize budget months to the first day of the month
 - [x] Monthly budget upsert/update behavior
 - [x] Preserve legacy paycheck/expense tables without automatic migration or double-counting
-- [ ] Complete real-data acceptance test and commit/push Commit 1
+- [x] Complete real-data acceptance test and move forward to Commit 2
+
+### Commit 2 - Budget Planning UI & Budget-vs-Actual Reporting — Implemented / Acceptance Testing
+- [x] Dedicated Budget sidebar page
+- [x] Previous/current/next month navigation
+- [x] Set or edit one monthly budget per expense category
+- [x] Remove a monthly budget without deleting transaction history
+- [x] Category-level planned, actual, remaining, percent-used, and status reporting
+- [x] Monthly summary totals for planned, categorized spend, and remaining
+- [x] Surface uncategorized bank outflow separately
+- [x] Use normalized `transactions` only for actual spending
+- [x] Exclude confirmed transfers from budget actuals
+- [x] Keep legacy `paychecks` / `expenses` out of normalized budget actuals
+- [x] Treat positive expense-category activity as a reduction of net category spending
+- [ ] Complete real-data acceptance test and commit/push Commit 2
 
 ### Planned Next Commits
-- [ ] Budget planning UI and budget-vs-actual reporting
 - [ ] Paycheck allocation rules
 - [ ] Savings goals
 - [ ] Continue connecting budgeting reports to normalized banking transactions
