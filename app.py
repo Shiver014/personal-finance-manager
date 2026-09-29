@@ -36,6 +36,30 @@ FONT_MONO  = ("Times New Roman", 12)
 
 MAX_W = 860
 
+# Budget/category defaults. These seed the normalized transaction categorization
+# model without changing existing legacy paycheck/expense records.
+DEFAULT_BUDGET_CATEGORIES = (
+    ("Food", "expense"),
+    ("Transport", "expense"),
+    ("Shopping", "expense"),
+    ("Entertainment", "expense"),
+    ("Health", "expense"),
+    ("Utilities", "expense"),
+    ("Housing", "expense"),
+    ("Subscriptions", "expense"),
+    ("Debt Payments", "expense"),
+    ("Insurance", "expense"),
+    ("Personal Care", "expense"),
+    ("Travel", "expense"),
+    ("Education", "expense"),
+    ("Other", "expense"),
+    ("Salary", "income"),
+    ("Bonus", "income"),
+    ("Interest", "income"),
+    ("Refund/Reimbursement", "income"),
+    ("Other Income", "income"),
+)
+
 # ═════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ═════════════════════════════════════════════════════════════════════════════
@@ -121,6 +145,31 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_reconciliations_account_date
         ON account_reconciliations(account_id, reconciliation_date);
 
+    -- Canonical categories used by normalized transactions and monthly budgets.
+    -- Transfers remain a special transaction classification rather than a budget category.
+    CREATE TABLE IF NOT EXISTS budget_categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL COLLATE NOCASE,
+        category_type TEXT NOT NULL CHECK(category_type IN ('expense','income')),
+        is_active INTEGER DEFAULT 1,
+        is_system INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(name));
+
+    CREATE TABLE IF NOT EXISTS monthly_budgets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category_id INTEGER NOT NULL,
+        budget_month TEXT NOT NULL,
+        amount REAL NOT NULL CHECK(amount >= 0),
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(category_id, budget_month),
+        FOREIGN KEY(category_id) REFERENCES budget_categories(id));
+
+    CREATE INDEX IF NOT EXISTS idx_monthly_budgets_month
+        ON monthly_budgets(budget_month);
+
     -- Recurring schedules table
     -- type: 'paycheck' | 'expense' | 'loan_payment'
     -- frequency: 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'yearly'
@@ -185,6 +234,18 @@ def init_db():
             account_id, tx_date, description, amount, occurrence_counts[base_key]
         )
         conn.execute("UPDATE transactions SET fingerprint=? WHERE id=?", (fp, tx_id))
+
+    # Seed canonical categories only when the new category table is empty. This
+    # gives a fresh database useful defaults without recreating names a user may
+    # later rename or deactivate.
+    category_count = conn.execute("SELECT COUNT(*) FROM budget_categories").fetchone()[0]
+    if category_count == 0:
+        for category_name, category_type in DEFAULT_BUDGET_CATEGORIES:
+            conn.execute(
+                """INSERT INTO budget_categories
+                   (name, category_type, is_active, is_system) VALUES (?,?,1,1)""",
+                (category_name, category_type),
+            )
 
     conn.commit(); conn.close()
 
@@ -341,6 +402,242 @@ def save_reconciliation(account_id, reconciliation_date, bank_balance, note=""):
     finally:
         conn.close()
     return expected, difference
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUDGETING / CATEGORY DATA ACCESS
+# ═════════════════════════════════════════════════════════════════════════════
+def get_budget_categories(category_type=None, active_only=True):
+    """Return canonical transaction/budget categories ordered by type and name."""
+    sql = """SELECT id, name, category_type, is_active, is_system, created_at
+             FROM budget_categories WHERE 1=1"""
+    params = []
+    if category_type is not None:
+        if category_type not in ("expense", "income"):
+            raise ValueError("Category type must be 'expense' or 'income'.")
+        sql += " AND category_type=?"
+        params.append(category_type)
+    if active_only:
+        sql += " AND is_active=1"
+    sql += " ORDER BY CASE category_type WHEN 'expense' THEN 0 ELSE 1 END, name COLLATE NOCASE"
+    conn = get_conn()
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def add_budget_category(name, category_type="expense"):
+    """Create a reusable category. Categories are deactivated rather than deleted."""
+    name = str(name or "").strip()
+    category_type = str(category_type or "").strip().lower()
+    if not name:
+        raise ValueError("Category name is required.")
+    if category_type not in ("expense", "income"):
+        raise ValueError("Category type must be 'expense' or 'income'.")
+    if name.lower() == "transfer":
+        raise ValueError("Transfer is reserved for confirmed internal transfers.")
+
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO budget_categories (name, category_type, is_active, is_system)
+               VALUES (?,?,1,0)""",
+            (name, category_type),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("A category with that name already exists.") from exc
+    finally:
+        conn.close()
+
+
+def update_budget_category(category_id, name, category_type):
+    """Rename/retype a category while preserving normalized transaction assignments."""
+    name = str(name or "").strip()
+    category_type = str(category_type or "").strip().lower()
+    if not name:
+        raise ValueError("Category name is required.")
+    if category_type not in ("expense", "income"):
+        raise ValueError("Category type must be 'expense' or 'income'.")
+    if name.lower() == "transfer":
+        raise ValueError("Transfer is reserved for confirmed internal transfers.")
+
+    conn = get_conn()
+    try:
+        old = conn.execute(
+            "SELECT name, category_type FROM budget_categories WHERE id=?", (category_id,)
+        ).fetchone()
+        if not old:
+            raise ValueError("Category not found.")
+        if old[1] != category_type:
+            has_budget = conn.execute(
+                "SELECT 1 FROM monthly_budgets WHERE category_id=? LIMIT 1", (category_id,)
+            ).fetchone()
+            if has_budget:
+                raise ValueError("A category with saved monthly budgets cannot change type.")
+
+        conn.execute(
+            "UPDATE budget_categories SET name=?, category_type=? WHERE id=?",
+            (name, category_type, category_id),
+        )
+        # transactions.category is intentionally text for compatibility with the
+        # existing banking model, so keep historical assignments in sync on rename.
+        conn.execute(
+            """UPDATE transactions
+               SET category=?, transaction_type=?
+               WHERE category=? AND COALESCE(transaction_type,'uncategorized') != 'transfer'""",
+            (name, category_type, old[0]),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("A category with that name already exists.") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def set_budget_category_active(category_id, active):
+    """Activate/deactivate a category without removing historical usage."""
+    conn = get_conn()
+    try:
+        updated = conn.execute(
+            "UPDATE budget_categories SET is_active=? WHERE id=?",
+            (1 if active else 0, category_id),
+        ).rowcount
+        if not updated:
+            raise ValueError("Category not found.")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def assign_transaction_category(transaction_ids, category_id=None):
+    """Assign/clear a canonical category on non-transfer normalized transactions.
+
+    Assigning a category also sets transaction_type to the category's declared
+    expense/income type. Confirmed transfers are protected and must be managed
+    through the transfer review workflow.
+    """
+    ids = sorted({int(tid) for tid in transaction_ids})
+    if not ids:
+        raise ValueError("Select at least one transaction.")
+
+    conn = get_conn()
+    try:
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id, transaction_type FROM transactions WHERE id IN ({placeholders})", ids
+        ).fetchall()
+        if len(rows) != len(ids):
+            raise ValueError("One or more selected transactions no longer exist.")
+        if any((r[1] or "uncategorized") == "transfer" for r in rows):
+            raise ValueError("Confirmed transfers cannot be categorized as income or expense.")
+
+        if category_id is None:
+            conn.execute(
+                f"UPDATE transactions SET category=NULL, transaction_type='uncategorized' "
+                f"WHERE id IN ({placeholders})", ids
+            )
+        else:
+            category = conn.execute(
+                """SELECT name, category_type FROM budget_categories
+                   WHERE id=? AND is_active=1""",
+                (int(category_id),),
+            ).fetchone()
+            if not category:
+                raise ValueError("Select an active category.")
+            conn.execute(
+                f"UPDATE transactions SET category=?, transaction_type=? "
+                f"WHERE id IN ({placeholders})",
+                [category[0], category[1], *ids],
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def normalize_budget_month(value):
+    """Normalize YYYY-MM or any YYYY-MM-DD value to the first day of that month."""
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        text += "-01"
+    try:
+        d = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("Budget month must use YYYY-MM or YYYY-MM-DD.") from exc
+    return d.replace(day=1).isoformat()
+
+
+def set_monthly_budget(category_id, budget_month, amount, note=""):
+    """Create/update one monthly expense budget using an idempotent upsert."""
+    month = normalize_budget_month(budget_month)
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Budget amount must be numeric.") from exc
+    if amount < 0:
+        raise ValueError("Budget amount cannot be negative.")
+
+    conn = get_conn()
+    try:
+        category = conn.execute(
+            "SELECT category_type FROM budget_categories WHERE id=?", (int(category_id),)
+        ).fetchone()
+        if not category:
+            raise ValueError("Category not found.")
+        if category[0] != "expense":
+            raise ValueError("Monthly spending budgets can only use expense categories.")
+        conn.execute(
+            """INSERT INTO monthly_budgets
+               (category_id, budget_month, amount, note) VALUES (?,?,?,?)
+               ON CONFLICT(category_id, budget_month) DO UPDATE SET
+                   amount=excluded.amount, note=excluded.note,
+                   updated_at=CURRENT_TIMESTAMP""",
+            (int(category_id), month, amount, str(note or "").strip()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_monthly_budgets(budget_month):
+    month = normalize_budget_month(budget_month)
+    conn = get_conn()
+    try:
+        return conn.execute(
+            """SELECT b.id, b.category_id, c.name, b.budget_month, b.amount, b.note, c.is_active
+               FROM monthly_budgets b
+               JOIN budget_categories c ON c.id=b.category_id
+               WHERE b.budget_month=?
+               ORDER BY c.name COLLATE NOCASE""",
+            (month,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def delete_monthly_budget(budget_id):
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM monthly_budgets WHERE id=?", (int(budget_id),))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2396,6 +2693,170 @@ class CSVImportDialog(tk.Toplevel):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TRANSACTION CATEGORY UI
+# ═════════════════════════════════════════════════════════════════════════════
+class CategoryEditDialog(tk.Toplevel):
+    def __init__(self, parent, category=None, on_save=None):
+        super().__init__(parent)
+        self.category = category
+        self.on_save = on_save
+        self.title("Edit Category" if category else "Add Category")
+        self.configure(bg=BG)
+        self.geometry("430x250")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        tk.Label(self, text="Edit Category" if category else "Add Category",
+                 bg=BG, fg=ACCENT4, font=FONT_H2).pack(pady=(18, 12))
+        body = tk.Frame(self, bg=BG); body.pack(fill="x", padx=28)
+        self.name_e = _dlg_row(body, "Name", category[1] if category else "")
+        self.type_var = tk.StringVar(value=category[2] if category else "expense")
+        type_row = tk.Frame(body, bg=BG); type_row.pack(fill="x", pady=4)
+        type_row.columnconfigure(0, weight=1); type_row.columnconfigure(1, weight=2)
+        tk.Label(type_row, text="Type", bg=BG, fg=TEXT, font=FONT_SMALL, anchor="w").grid(
+            row=0, column=0, sticky="w")
+        type_combo = ttk.Combobox(type_row, textvariable=self.type_var, values=["expense", "income"],
+                                  state="readonly", width=18, font=FONT_BODY)
+        type_combo.grid(row=0, column=1, sticky="ew", padx=(10,0))
+        styled_btn(self, "Save Category", self._save, color=ACCENT4, fg=BG).pack(pady=18)
+
+    def _save(self):
+        try:
+            if self.category:
+                update_budget_category(self.category[0], self.name_e.get(), self.type_var.get())
+            else:
+                add_budget_category(self.name_e.get(), self.type_var.get())
+        except Exception as exc:
+            messagebox.showerror("Category Error", str(exc), parent=self)
+            return
+        self.destroy()
+        if self.on_save:
+            self.on_save()
+
+
+class CategoryManagerDialog(tk.Toplevel):
+    def __init__(self, parent, on_change=None):
+        super().__init__(parent)
+        self.on_change = on_change
+        self.title("Manage Categories")
+        self.configure(bg=BG)
+        self.geometry("680x520")
+        self.minsize(620, 450)
+        self.transient(parent)
+        self.grab_set()
+
+        tk.Label(self, text="Transaction Categories", bg=BG, fg=ACCENT4, font=FONT_H2).pack(pady=(16, 4))
+        tk.Label(
+            self,
+            text=("Categories classify normalized banking transactions. Deactivation preserves history; "
+                  "confirmed transfers are managed separately."),
+            bg=BG, fg=TEXT_DIM, font=FONT_SMALL, wraplength=620, justify="left",
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        card = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=24, pady=(0, 10))
+        self.tree = make_tree(card, ("Name", "Type", "Status"), (310, 130, 120), height=13)
+        self.tree.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        scroll = ttk.Scrollbar(card, orient="vertical", command=self.tree.yview)
+        scroll.pack(side="right", fill="y", pady=8)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<Double-1>", lambda _e: self._edit())
+
+        controls = tk.Frame(self, bg=BG); controls.pack(fill="x", padx=24, pady=(0, 16))
+        styled_btn(controls, "+ Add", self._add, color=ACCENT, fg=BG).pack(side="left")
+        styled_btn(controls, "Edit", self._edit, color=ACCENT4, fg=BG).pack(side="left", padx=8)
+        styled_btn(controls, "Activate / Deactivate", self._toggle, color=ACCENT5, fg=BG).pack(side="left")
+        styled_btn(controls, "Close", self.destroy, color=BORDER, fg=TEXT).pack(side="right")
+        self._refresh()
+
+    def _refresh(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for row in get_budget_categories(active_only=False):
+            self.tree.insert("", "end", iid=str(row[0]), values=(
+                row[1], row[2].capitalize(), "Active" if row[3] else "Inactive"
+            ))
+        if self.on_change:
+            self.on_change()
+
+    def _selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select Category", "Select a category first.", parent=self)
+            return None
+        cid = int(sel[0])
+        return next((r for r in get_budget_categories(active_only=False) if r[0] == cid), None)
+
+    def _add(self):
+        CategoryEditDialog(self, on_save=self._refresh)
+
+    def _edit(self):
+        category = self._selected()
+        if category:
+            CategoryEditDialog(self, category=category, on_save=self._refresh)
+
+    def _toggle(self):
+        category = self._selected()
+        if not category:
+            return
+        try:
+            set_budget_category_active(category[0], not bool(category[3]))
+        except Exception as exc:
+            messagebox.showerror("Category Error", str(exc), parent=self)
+            return
+        self._refresh()
+
+
+class CategoryAssignmentDialog(tk.Toplevel):
+    def __init__(self, parent, transaction_ids, on_save=None):
+        super().__init__(parent)
+        self.transaction_ids = transaction_ids
+        self.on_save = on_save
+        self.title("Categorize Transactions")
+        self.configure(bg=BG)
+        self.geometry("500x260")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        tk.Label(self, text="Categorize Selected", bg=BG, fg=ACCENT4, font=FONT_H2).pack(pady=(18, 5))
+        tk.Label(self, text=f"{len(transaction_ids)} transaction(s) selected",
+                 bg=BG, fg=TEXT_DIM, font=FONT_SMALL).pack(pady=(0, 14))
+
+        categories = get_budget_categories(active_only=True)
+        self.category_map = {f"{r[2].capitalize()} — {r[1]}": r[0] for r in categories}
+        self.category_var = tk.StringVar()
+        if self.category_map:
+            self.category_var.set(next(iter(self.category_map)))
+        body = tk.Frame(self, bg=BG); body.pack(fill="x", padx=28)
+        category_row = tk.Frame(body, bg=BG); category_row.pack(fill="x", pady=4)
+        category_row.columnconfigure(0, weight=1); category_row.columnconfigure(1, weight=2)
+        tk.Label(category_row, text="Category", bg=BG, fg=TEXT, font=FONT_SMALL, anchor="w").grid(
+            row=0, column=0, sticky="w")
+        category_combo = ttk.Combobox(
+            category_row, textvariable=self.category_var, values=list(self.category_map.keys()),
+            state="readonly", width=30, font=FONT_BODY
+        )
+        category_combo.grid(row=0, column=1, sticky="ew", padx=(10,0))
+        styled_btn(self, "Apply Category", self._save, color=ACCENT, fg=BG).pack(pady=20)
+
+    def _save(self):
+        category_id = self.category_map.get(self.category_var.get())
+        if not category_id:
+            messagebox.showerror("Category", "No active category is available.", parent=self)
+            return
+        try:
+            assign_transaction_category(self.transaction_ids, category_id)
+        except Exception as exc:
+            messagebox.showerror("Category Error", str(exc), parent=self)
+            return
+        self.destroy()
+        if self.on_save:
+            self.on_save()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS VIEWER
 # ═════════════════════════════════════════════════════════════════════════════
 class TransactionsTab(tk.Frame):
@@ -2411,6 +2872,9 @@ class TransactionsTab(tk.Frame):
         header.pack(fill="x", padx=28, pady=(26, 10))
         tk.Label(header, text="Transactions", bg=BG, fg=TEXT, font=FONT_H1).pack(side="left")
         styled_btn(header, "Reset Filters", self._reset_filters, color=ACCENT5).pack(side="right")
+        styled_btn(header, "Manage Categories", self._manage_categories, color=ACCENT4, fg=BG).pack(side="right", padx=(0,8))
+        styled_btn(header, "Clear Category", self._clear_category, color=BORDER, fg=TEXT).pack(side="right", padx=(0,8))
+        styled_btn(header, "Categorize Selected", self._categorize_selected, color=ACCENT, fg=BG).pack(side="right", padx=(0,8))
 
         filters = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
         filters.pack(fill="x", padx=28, pady=(0, 12))
@@ -2535,6 +2999,34 @@ class TransactionsTab(tk.Frame):
                   f"  •  Non-transfer outflow: {fmt_money(outflow)}  •  Transfer entries: {transfers}"),
             fg=TEXT_DIM,
         )
+
+    def _categorize_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Select Transactions", "Select one or more transactions first.", parent=self)
+            return
+        CategoryAssignmentDialog(self, [int(i) for i in selected], on_save=self.refresh)
+
+    def _clear_category(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Select Transactions", "Select one or more transactions first.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Clear Category",
+            f"Clear the category from {len(selected)} selected transaction(s)?",
+            parent=self,
+        ):
+            return
+        try:
+            assign_transaction_category([int(i) for i in selected], None)
+        except Exception as exc:
+            messagebox.showerror("Category Error", str(exc), parent=self)
+            return
+        self.refresh()
+
+    def _manage_categories(self):
+        CategoryManagerDialog(self, on_change=self.refresh)
 
     def _reset_filters(self):
         self.account_var.set("All Accounts")
