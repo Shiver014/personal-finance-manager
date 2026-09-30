@@ -60,6 +60,12 @@ DEFAULT_BUDGET_CATEGORIES = (
     ("Other Income", "income"),
 )
 
+# Paycheck allocation rules are planning instructions only. They do not move
+# money between accounts or create banking transactions.
+ALLOCATION_BUCKETS = ("Bills", "Spending", "Savings", "Investments", "Debt", "Other")
+ALLOCATION_METHODS = ("percentage", "fixed", "remainder")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ═════════════════════════════════════════════════════════════════════════════
@@ -169,6 +175,46 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_monthly_budgets_month
         ON monthly_budgets(budget_month);
+
+    -- Reusable paycheck allocation rules. Rules describe a plan only; they do
+    -- not create transfers or banking transactions.
+    CREATE TABLE IF NOT EXISTS paycheck_allocation_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        bucket TEXT NOT NULL CHECK(bucket IN ('Bills','Spending','Savings','Investments','Debt','Other')),
+        method TEXT NOT NULL CHECK(method IN ('percentage','fixed','remainder')),
+        value REAL NOT NULL DEFAULT 0 CHECK(value >= 0),
+        priority INTEGER NOT NULL DEFAULT 100,
+        is_active INTEGER DEFAULT 1,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+
+    CREATE TABLE IF NOT EXISTS paycheck_allocation_plans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_date TEXT NOT NULL,
+        paycheck_amount REAL NOT NULL CHECK(paycheck_amount > 0),
+        allocated_amount REAL NOT NULL,
+        unallocated_amount REAL NOT NULL,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+
+    CREATE TABLE IF NOT EXISTS paycheck_allocation_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_id INTEGER NOT NULL,
+        rule_id INTEGER,
+        rule_name TEXT NOT NULL,
+        bucket TEXT NOT NULL,
+        method TEXT NOT NULL,
+        rule_value REAL NOT NULL,
+        amount REAL NOT NULL,
+        priority INTEGER NOT NULL,
+        FOREIGN KEY(plan_id) REFERENCES paycheck_allocation_plans(id),
+        FOREIGN KEY(rule_id) REFERENCES paycheck_allocation_rules(id));
+
+    CREATE INDEX IF NOT EXISTS idx_paycheck_allocation_plans_date
+        ON paycheck_allocation_plans(plan_date);
+    CREATE INDEX IF NOT EXISTS idx_paycheck_allocation_items_plan
+        ON paycheck_allocation_items(plan_id);
 
     -- Recurring schedules table
     -- type: 'paycheck' | 'expense' | 'loan_payment'
@@ -804,6 +850,265 @@ def get_budget_report(budget_month):
         "uncategorized_count": int(uncategorized_row[0] or 0),
         "uncategorized_outflow": float(uncategorized_row[1] or 0),
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAYCHECK ALLOCATION DATA ACCESS
+# ═════════════════════════════════════════════════════════════════════════════
+def _validate_allocation_rule(name, bucket, method, value, priority):
+    name = str(name or "").strip()
+    bucket = str(bucket or "").strip()
+    method = str(method or "").strip().lower()
+    if not name:
+        raise ValueError("Rule name is required.")
+    if bucket not in ALLOCATION_BUCKETS:
+        raise ValueError("Select a valid allocation bucket.")
+    if method not in ALLOCATION_METHODS:
+        raise ValueError("Select a valid allocation method.")
+    try:
+        priority = int(priority)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Priority must be a whole number.") from exc
+    if priority < 0:
+        raise ValueError("Priority cannot be negative.")
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Rule value must be numeric.") from exc
+    if value < 0:
+        raise ValueError("Rule value cannot be negative.")
+    if method == "percentage" and value > 100:
+        raise ValueError("A percentage rule cannot exceed 100%.")
+    if method == "remainder":
+        value = 0.0
+    return name, bucket, method, value, priority
+
+
+def get_allocation_rules(active_only=False):
+    sql = """SELECT id, name, bucket, method, value, priority, is_active, note, created_at
+             FROM paycheck_allocation_rules"""
+    params = []
+    if active_only:
+        sql += " WHERE is_active=1"
+    sql += " ORDER BY priority, id"
+    conn = get_conn()
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _ensure_single_active_remainder(conn, exclude_rule_id=None):
+    sql = "SELECT id FROM paycheck_allocation_rules WHERE is_active=1 AND method='remainder'"
+    params = []
+    if exclude_rule_id is not None:
+        sql += " AND id<>?"
+        params.append(int(exclude_rule_id))
+    return conn.execute(sql + " LIMIT 1", params).fetchone() is None
+
+
+def add_allocation_rule(name, bucket, method, value=0, priority=100, note=""):
+    name, bucket, method, value, priority = _validate_allocation_rule(
+        name, bucket, method, value, priority
+    )
+    conn = get_conn()
+    try:
+        if method == "remainder" and not _ensure_single_active_remainder(conn):
+            raise ValueError("Only one active remainder rule is allowed.")
+        cur = conn.execute(
+            """INSERT INTO paycheck_allocation_rules
+               (name, bucket, method, value, priority, is_active, note)
+               VALUES (?,?,?,?,?,1,?)""",
+            (name, bucket, method, value, priority, str(note or "").strip()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("An allocation rule with that name already exists.") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_allocation_rule(rule_id, name, bucket, method, value=0, priority=100, note=""):
+    name, bucket, method, value, priority = _validate_allocation_rule(
+        name, bucket, method, value, priority
+    )
+    conn = get_conn()
+    try:
+        current = conn.execute(
+            "SELECT is_active FROM paycheck_allocation_rules WHERE id=?", (int(rule_id),)
+        ).fetchone()
+        if not current:
+            raise ValueError("Allocation rule not found.")
+        if current[0] and method == "remainder" and not _ensure_single_active_remainder(conn, rule_id):
+            raise ValueError("Only one active remainder rule is allowed.")
+        conn.execute(
+            """UPDATE paycheck_allocation_rules
+               SET name=?, bucket=?, method=?, value=?, priority=?, note=? WHERE id=?""",
+            (name, bucket, method, value, priority, str(note or "").strip(), int(rule_id)),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("An allocation rule with that name already exists.") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def set_allocation_rule_active(rule_id, active):
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT method FROM paycheck_allocation_rules WHERE id=?", (int(rule_id),)
+        ).fetchone()
+        if not row:
+            raise ValueError("Allocation rule not found.")
+        if active and row[0] == "remainder" and not _ensure_single_active_remainder(conn, rule_id):
+            raise ValueError("Only one active remainder rule is allowed.")
+        conn.execute(
+            "UPDATE paycheck_allocation_rules SET is_active=? WHERE id=?",
+            (1 if active else 0, int(rule_id)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def calculate_paycheck_allocation(paycheck_amount):
+    """Calculate a paycheck plan from active allocation rules without saving it.
+
+    Percentage rules use the full paycheck as their base. Fixed rules reserve a
+    dollar amount. One optional remainder rule receives whatever is left after
+    all percentage/fixed rules. The returned report exposes over-allocation
+    rather than silently reducing any rule.
+    """
+    try:
+        paycheck_amount = round(float(paycheck_amount), 2)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Paycheck amount must be numeric.") from exc
+    if paycheck_amount <= 0:
+        raise ValueError("Paycheck amount must be greater than zero.")
+
+    rules = get_allocation_rules(active_only=True)
+    remainder_rules = [r for r in rules if r[3] == "remainder"]
+    if len(remainder_rules) > 1:
+        raise ValueError("Only one active remainder rule is allowed.")
+
+    items = []
+    subtotal = 0.0
+    for rule in rules:
+        rule_id, name, bucket, method, value, priority, _active, note, _created = rule
+        if method == "remainder":
+            continue
+        if method == "percentage":
+            amount = round(paycheck_amount * float(value) / 100.0, 2)
+        else:
+            amount = round(float(value), 2)
+        subtotal = round(subtotal + amount, 2)
+        items.append({
+            "rule_id": int(rule_id), "rule_name": name, "bucket": bucket,
+            "method": method, "rule_value": float(value), "priority": int(priority),
+            "amount": amount, "note": note or "",
+        })
+
+    if remainder_rules:
+        rule = remainder_rules[0]
+        remainder_amount = round(max(paycheck_amount - subtotal, 0.0), 2)
+        items.append({
+            "rule_id": int(rule[0]), "rule_name": rule[1], "bucket": rule[2],
+            "method": rule[3], "rule_value": 0.0, "priority": int(rule[5]),
+            "amount": remainder_amount, "note": rule[7] or "",
+        })
+        subtotal = round(subtotal + remainder_amount, 2)
+
+    allocated = round(sum(item["amount"] for item in items), 2)
+    overallocated = round(max(allocated - paycheck_amount, 0.0), 2)
+    unallocated = round(max(paycheck_amount - allocated, 0.0), 2)
+    return {
+        "paycheck_amount": paycheck_amount,
+        "items": sorted(items, key=lambda x: (x["priority"], x["rule_id"])),
+        "allocated_amount": allocated,
+        "unallocated_amount": unallocated,
+        "overallocated_amount": overallocated,
+    }
+
+
+def save_paycheck_allocation_plan(plan_date, paycheck_amount, note=""):
+    """Save an immutable snapshot of the current allocation-rule calculation."""
+    try:
+        date.fromisoformat(str(plan_date).strip())
+    except ValueError as exc:
+        raise ValueError("Plan date must use YYYY-MM-DD.") from exc
+    report = calculate_paycheck_allocation(paycheck_amount)
+    if not report["items"]:
+        raise ValueError("Add at least one active allocation rule before saving a plan.")
+    if report["overallocated_amount"] > 0.004:
+        raise ValueError(
+            f"Allocation rules exceed the paycheck by {fmt_money(report['overallocated_amount'])}."
+        )
+
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO paycheck_allocation_plans
+               (plan_date, paycheck_amount, allocated_amount, unallocated_amount, note)
+               VALUES (?,?,?,?,?)""",
+            (str(plan_date).strip(), report["paycheck_amount"], report["allocated_amount"],
+             report["unallocated_amount"], str(note or "").strip()),
+        )
+        plan_id = cur.lastrowid
+        for item in report["items"]:
+            conn.execute(
+                """INSERT INTO paycheck_allocation_items
+                   (plan_id, rule_id, rule_name, bucket, method, rule_value, amount, priority)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (plan_id, item["rule_id"], item["rule_name"], item["bucket"], item["method"],
+                 item["rule_value"], item["amount"], item["priority"]),
+            )
+        conn.commit()
+        return plan_id, report
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_recent_allocation_plans(limit=10):
+    limit = max(1, min(int(limit), 100))
+    conn = get_conn()
+    try:
+        return conn.execute(
+            """SELECT id, plan_date, paycheck_amount, allocated_amount, unallocated_amount, note, created_at
+               FROM paycheck_allocation_plans
+               ORDER BY plan_date DESC, id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def get_allocation_plan_items(plan_id):
+    conn = get_conn()
+    try:
+        return conn.execute(
+            """SELECT id, rule_id, rule_name, bucket, method, rule_value, amount, priority
+               FROM paycheck_allocation_items WHERE plan_id=?
+               ORDER BY priority, id""",
+            (int(plan_id),),
+        ).fetchall()
+    finally:
+        conn.close()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3280,6 +3585,304 @@ class BudgetTab(tk.Frame):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# PAYCHECK ALLOCATION UI
+# ═════════════════════════════════════════════════════════════════════════════
+class AllocationRuleEditDialog(tk.Toplevel):
+    def __init__(self, parent, existing=None, on_save=None):
+        super().__init__(parent)
+        self.existing = existing
+        self.on_save = on_save
+        self.title("Edit Allocation Rule" if existing else "Add Allocation Rule")
+        self.configure(bg=BG)
+        self.geometry("500x455")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        tk.Label(self, text="Paycheck Allocation Rule", bg=BG, fg=ACCENT4, font=FONT_H2).pack(pady=(18,12))
+        body = tk.Frame(self, bg=BG); body.pack(fill="x", padx=28)
+        name = existing[1] if existing else ""
+        bucket = existing[2] if existing else "Savings"
+        method = existing[3] if existing else "percentage"
+        value = existing[4] if existing else ""
+        priority = existing[5] if existing else 100
+        note = existing[7] if existing else ""
+
+        self.name_e = _dlg_row(body, "Rule Name", name)
+
+        def combo_row(label, variable, values):
+            row = tk.Frame(body, bg=BG); row.pack(fill="x", pady=4)
+            row.columnconfigure(0, weight=1); row.columnconfigure(1, weight=2)
+            tk.Label(row, text=label, bg=BG, fg=TEXT, font=FONT_SMALL, anchor="w").grid(
+                row=0, column=0, sticky="w"
+            )
+            combo = ttk.Combobox(row, textvariable=variable, values=values,
+                                 state="readonly", font=FONT_BODY)
+            combo.grid(row=0, column=1, sticky="ew", padx=(10,0))
+            return combo
+
+        self.bucket_var = tk.StringVar(value=bucket)
+        combo_row("Bucket", self.bucket_var, ALLOCATION_BUCKETS)
+        self.method_var = tk.StringVar(value=method)
+        method_cb = combo_row("Method", self.method_var, ALLOCATION_METHODS)
+        self.value_e = _dlg_row(body, "Value", value)
+        self.priority_e = _dlg_row(body, "Priority", priority)
+        self.note_e = _dlg_row(body, "Note", note or "")
+
+        self.help_lbl = tk.Label(self, bg=BG, fg=TEXT_DIM, font=FONT_SMALL,
+                                 wraplength=430, justify="left")
+        self.help_lbl.pack(fill="x", padx=28, pady=(12,4))
+        self.method_var.trace_add("write", lambda *_: self._update_help())
+        self._update_help()
+        styled_btn(self, "Save Rule", self._save, color=ACCENT4, fg=BG).pack(pady=14)
+
+    def _update_help(self):
+        method = self.method_var.get()
+        if method == "percentage":
+            self.help_lbl.configure(text="Percentage uses the full paycheck as its base. Example: 20 means 20% of the paycheck.")
+            self.value_e.configure(state="normal")
+        elif method == "fixed":
+            self.help_lbl.configure(text="Fixed reserves the same dollar amount from every paycheck plan.")
+            self.value_e.configure(state="normal")
+        else:
+            self.help_lbl.configure(text="Remainder receives whatever is left after percentage and fixed rules. Only one active remainder rule is allowed.")
+            self.value_e.delete(0, "end"); self.value_e.insert(0, "0")
+            self.value_e.configure(state="disabled")
+
+    def _save(self):
+        try:
+            if self.existing:
+                update_allocation_rule(
+                    self.existing[0], self.name_e.get(), self.bucket_var.get(), self.method_var.get(),
+                    self.value_e.get() if self.method_var.get() != "remainder" else 0,
+                    self.priority_e.get(), self.note_e.get(),
+                )
+            else:
+                add_allocation_rule(
+                    self.name_e.get(), self.bucket_var.get(), self.method_var.get(),
+                    self.value_e.get() if self.method_var.get() != "remainder" else 0,
+                    self.priority_e.get(), self.note_e.get(),
+                )
+        except Exception as exc:
+            messagebox.showerror("Allocation Rule Error", str(exc), parent=self)
+            return
+        self.destroy()
+        if self.on_save: self.on_save()
+
+
+class AllocationRuleManagerDialog(tk.Toplevel):
+    def __init__(self, parent, on_change=None):
+        super().__init__(parent)
+        self.on_change = on_change
+        self.title("Paycheck Allocation Rules")
+        self.configure(bg=BG)
+        self.geometry("850x560")
+        self.minsize(760, 500)
+        self.transient(parent)
+        self.grab_set()
+        self.row_map = {}
+
+        header = tk.Frame(self, bg=BG); header.pack(fill="x", padx=24, pady=(18,10))
+        tk.Label(header, text="Paycheck Allocation Rules", bg=BG, fg=ACCENT4, font=FONT_H2).pack(side="left")
+        styled_btn(header, "+ Add Rule", self._add, color=ACCENT, fg=BG).pack(side="right")
+        tk.Label(self, text="Rules are planning instructions only; they do not transfer money or create transactions.",
+                 bg=BG, fg=TEXT_DIM, font=FONT_SMALL, anchor="w").pack(fill="x", padx=24, pady=(0,8))
+
+        card = tk.Frame(self, bg=BG2, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=24, pady=(0,10))
+        cols=("priority","name","bucket","method","value","status")
+        self.tree=ttk.Treeview(card,columns=cols,show="headings",height=15,selectmode="browse")
+        specs=(("priority","Priority",70,"e"),("name","Rule",190,"w"),("bucket","Bucket",120,"w"),
+               ("method","Method",110,"w"),("value","Value",110,"e"),("status","Status",90,"w"))
+        for c,t,w,a in specs:
+            self.tree.heading(c,text=t); self.tree.column(c,width=w,anchor=a)
+        self.tree.pack(side="left",fill="both",expand=True,padx=(8,0),pady=8)
+        sb=ttk.Scrollbar(card,orient="vertical",command=self.tree.yview); sb.pack(side="right",fill="y",padx=(0,8),pady=8)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<Double-1>", lambda _e:self._edit())
+
+        controls=tk.Frame(self,bg=BG); controls.pack(fill="x",padx=24,pady=(0,16))
+        styled_btn(controls,"Edit Selected",self._edit,color=ACCENT4,fg=BG).pack(side="left")
+        styled_btn(controls,"Activate / Deactivate",self._toggle,color=ACCENT5,fg=BG).pack(side="left",padx=8)
+        styled_btn(controls,"Close",self.destroy,color=BORDER,fg=TEXT).pack(side="right")
+        self.refresh()
+
+    def refresh(self):
+        for item in self.tree.get_children(): self.tree.delete(item)
+        self.row_map={r[0]:r for r in get_allocation_rules(active_only=False)}
+        for r in self.row_map.values():
+            method=r[3]
+            value="Remainder" if method=="remainder" else (f"{r[4]:.2f}%" if method=="percentage" else fmt_money(r[4]))
+            self.tree.insert("","end",iid=str(r[0]),values=(r[5],r[1],r[2],method.title(),value,"Active" if r[6] else "Inactive"))
+
+    def _selected(self):
+        sel=self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select Rule","Select an allocation rule first.",parent=self); return None
+        return self.row_map.get(int(sel[0]))
+
+    def _add(self):
+        AllocationRuleEditDialog(self,on_save=self._changed)
+
+    def _edit(self):
+        row=self._selected()
+        if row: AllocationRuleEditDialog(self,existing=row,on_save=self._changed)
+
+    def _toggle(self):
+        row=self._selected()
+        if not row: return
+        try: set_allocation_rule_active(row[0], not bool(row[6]))
+        except Exception as exc:
+            messagebox.showerror("Allocation Rule Error",str(exc),parent=self); return
+        self._changed()
+
+    def _changed(self):
+        self.refresh()
+        if self.on_change: self.on_change()
+
+
+class AllocationPlanDetailsDialog(tk.Toplevel):
+    def __init__(self, parent, plan):
+        super().__init__(parent)
+        self.title("Saved Paycheck Plan")
+        self.configure(bg=BG)
+        self.geometry("760x480")
+        self.transient(parent)
+        self.grab_set()
+        plan_id, plan_date, paycheck, allocated, unallocated, note, created = plan
+        tk.Label(self,text=f"Paycheck Plan — {plan_date}",bg=BG,fg=ACCENT4,font=FONT_H2).pack(pady=(18,4))
+        tk.Label(self,text=f"Paycheck {fmt_money(paycheck)}  •  Allocated {fmt_money(allocated)}  •  Unallocated {fmt_money(unallocated)}",
+                 bg=BG,fg=TEXT,font=FONT_BODY).pack(pady=(0,10))
+        if note:
+            tk.Label(self,text=note,bg=BG,fg=TEXT_DIM,font=FONT_SMALL).pack(pady=(0,8))
+        card=tk.Frame(self,bg=BG2,highlightbackground=BORDER,highlightthickness=1); card.pack(fill="both",expand=True,padx=24,pady=(0,16))
+        cols=("rule","bucket","method","amount")
+        tree=ttk.Treeview(card,columns=cols,show="headings",height=12)
+        for c,t,w,a in (("rule","Rule",220,"w"),("bucket","Bucket",130,"w"),("method","Method",130,"w"),("amount","Amount",130,"e")):
+            tree.heading(c,text=t); tree.column(c,width=w,anchor=a)
+        tree.pack(fill="both",expand=True,padx=8,pady=8)
+        for item in get_allocation_plan_items(plan_id):
+            _iid, _rid, rule_name, bucket, method, rule_value, amount, priority=item
+            method_text = "Remainder" if method=="remainder" else (f"{rule_value:g}%" if method=="percentage" else f"Fixed {fmt_money(rule_value)}")
+            tree.insert("","end",values=(rule_name,bucket,method_text,fmt_money(amount)))
+
+
+class AllocationTab(tk.Frame):
+    """Paycheck planning calculator backed by reusable allocation rules."""
+    def __init__(self,parent):
+        super().__init__(parent,bg=BG)
+        self.preview_report=None
+        self.plan_map={}
+        self._build(); self.refresh()
+
+    def _build(self):
+        header=tk.Frame(self,bg=BG); header.pack(fill="x",padx=28,pady=(24,10))
+        tk.Label(header,text="Paycheck Allocation",bg=BG,fg=TEXT,font=FONT_H1).pack(side="left")
+        styled_btn(header,"Manage Rules",self._manage_rules,color=ACCENT4,fg=BG).pack(side="right")
+
+        info=tk.Label(self,text=("Create a plan for each paycheck using percentage, fixed-dollar, and optional remainder rules. "
+                                 "Saving a plan records a snapshot only—it does not move money between accounts."),
+                      bg=BG,fg=TEXT_DIM,font=FONT_SMALL,anchor="w",justify="left",wraplength=1050)
+        info.pack(fill="x",padx=30,pady=(0,10))
+
+        form=section_card(self,"Plan a Paycheck"); form.pack(fill="x",padx=28,pady=(0,10))
+        grid=tk.Frame(form,bg=BG2); grid.pack(fill="x",padx=18,pady=(0,10))
+        tk.Label(grid,text="Paycheck Amount ($)",bg=BG2,fg=TEXT_DIM,font=FONT_SMALL).grid(row=0,column=0,sticky="w",padx=(0,6))
+        self.amount_e=styled_entry(grid,width=16); self.amount_e.grid(row=0,column=1,sticky="w",padx=(0,18))
+        tk.Label(grid,text="Date",bg=BG2,fg=TEXT_DIM,font=FONT_SMALL).grid(row=0,column=2,sticky="w",padx=(0,6))
+        self.date_e=styled_entry(grid,width=13); self.date_e.grid(row=0,column=3,sticky="w",padx=(0,18)); self.date_e.insert(0,today_str())
+        tk.Label(grid,text="Note",bg=BG2,fg=TEXT_DIM,font=FONT_SMALL).grid(row=0,column=4,sticky="w",padx=(0,6))
+        self.note_e=styled_entry(grid,width=32); self.note_e.grid(row=0,column=5,sticky="ew")
+        grid.columnconfigure(5,weight=1)
+        buttons=tk.Frame(form,bg=BG2); buttons.pack(fill="x",padx=18,pady=(0,12))
+        styled_btn(buttons,"Preview Allocation",self._preview,color=ACCENT,fg=BG).pack(side="left")
+        styled_btn(buttons,"Save Plan",self._save_plan,color=ACCENT4,fg=BG).pack(side="left",padx=8)
+        styled_btn(buttons,"Clear",self._clear,color=BORDER,fg=TEXT).pack(side="left")
+
+        summaries=tk.Frame(self,bg=BG); summaries.pack(fill="x",padx=28,pady=(0,10)); summaries.columnconfigure((0,1,2,3),weight=1)
+        self.summary_labels={}
+        for i,(key,title,clr) in enumerate((("paycheck","PAYCHECK",ACCENT4),("allocated","PLANNED",ACCENT),
+                                           ("unallocated","UNALLOCATED",ACCENT3),("over","OVER-ALLOCATED",ACCENT2))):
+            c=tk.Frame(summaries,bg=BG3,highlightthickness=1,highlightbackground=BORDER); c.grid(row=0,column=i,sticky="nsew",padx=4,ipady=6)
+            tk.Label(c,text=title,bg=BG3,fg=TEXT_DIM,font=FONT_SMALL).pack(pady=(7,2))
+            v=tk.Label(c,text="$0.00",bg=BG3,fg=clr,font=("Times New Roman",15,"bold")); v.pack(pady=(0,7)); self.summary_labels[key]=v
+
+        body=tk.Frame(self,bg=BG); body.pack(fill="both",expand=True,padx=28,pady=(0,18)); body.columnconfigure((0,1),weight=1); body.rowconfigure(0,weight=1)
+        left=section_card(body,"Allocation Preview"); left.grid(row=0,column=0,sticky="nsew",padx=(0,5))
+        cols=("rule","bucket","method","amount")
+        self.preview_tree=ttk.Treeview(left,columns=cols,show="headings",height=11)
+        for c,t,w,a in (("rule","Rule",190,"w"),("bucket","Bucket",110,"w"),("method","Method",110,"w"),("amount","Amount",110,"e")):
+            self.preview_tree.heading(c,text=t); self.preview_tree.column(c,width=w,anchor=a)
+        self.preview_tree.pack(fill="both",expand=True,padx=10,pady=(0,10))
+
+        right=section_card(body,"Recent Saved Plans"); right.grid(row=0,column=1,sticky="nsew",padx=(5,0))
+        cols2=("date","paycheck","allocated","unallocated")
+        self.history_tree=ttk.Treeview(right,columns=cols2,show="headings",height=11,selectmode="browse")
+        for c,t,w,a in (("date","Date",100,"w"),("paycheck","Paycheck",110,"e"),("allocated","Allocated",110,"e"),("unallocated","Unallocated",110,"e")):
+            self.history_tree.heading(c,text=t); self.history_tree.column(c,width=w,anchor=a)
+        self.history_tree.pack(fill="both",expand=True,padx=10,pady=(0,6))
+        self.history_tree.bind("<Double-1>",lambda _e:self._view_plan())
+        footer=tk.Frame(right,bg=BG2); footer.pack(fill="x",padx=10,pady=(0,10))
+        styled_btn(footer,"View Selected",self._view_plan,color=BORDER,fg=TEXT).pack(side="left")
+
+    def _amount(self):
+        text=self.amount_e.get().replace(",","").replace("$","").strip()
+        return float(text)
+
+    def _preview(self):
+        try: report=calculate_paycheck_allocation(self._amount())
+        except Exception as exc:
+            messagebox.showerror("Allocation Error",str(exc),parent=self); return None
+        self.preview_report=report; self._render_preview(report); return report
+
+    def _render_preview(self,report):
+        for item in self.preview_tree.get_children(): self.preview_tree.delete(item)
+        for idx,row in enumerate(report["items"]):
+            method_text="Remainder" if row["method"]=="remainder" else (f"{row['rule_value']:g}%" if row["method"]=="percentage" else "Fixed")
+            self.preview_tree.insert("","end",iid=str(idx),values=(row["rule_name"],row["bucket"],method_text,fmt_money(row["amount"])))
+        self.summary_labels["paycheck"].configure(text=fmt_money(report["paycheck_amount"]))
+        self.summary_labels["allocated"].configure(text=fmt_money(report["allocated_amount"]))
+        self.summary_labels["unallocated"].configure(text=fmt_money(report["unallocated_amount"]))
+        self.summary_labels["over"].configure(text=fmt_money(report["overallocated_amount"]))
+
+    def _save_plan(self):
+        ds=self.date_e.get().strip()
+        try:
+            plan_id, report=save_paycheck_allocation_plan(ds,self._amount(),self.note_e.get())
+        except Exception as exc:
+            messagebox.showerror("Save Plan Error",str(exc),parent=self); return
+        self.preview_report=report; self._render_preview(report); self.refresh()
+        messagebox.showinfo("Plan Saved",f"Saved paycheck allocation plan #{plan_id}.\nUnallocated: {fmt_money(report['unallocated_amount'])}",parent=self)
+
+    def _manage_rules(self):
+        AllocationRuleManagerDialog(self,on_change=self._rules_changed)
+
+    def _rules_changed(self):
+        self.preview_report=None
+        for item in self.preview_tree.get_children(): self.preview_tree.delete(item)
+        for key in self.summary_labels: self.summary_labels[key].configure(text="$0.00")
+
+    def _clear(self):
+        self.amount_e.delete(0,"end"); self.note_e.delete(0,"end")
+        self.preview_report=None
+        for item in self.preview_tree.get_children(): self.preview_tree.delete(item)
+        for key in self.summary_labels: self.summary_labels[key].configure(text="$0.00")
+
+    def refresh(self):
+        for item in self.history_tree.get_children(): self.history_tree.delete(item)
+        plans=get_recent_allocation_plans(12); self.plan_map={p[0]:p for p in plans}
+        for p in plans:
+            self.history_tree.insert("","end",iid=str(p[0]),values=(p[1],fmt_money(p[2]),fmt_money(p[3]),fmt_money(p[4])))
+
+    def _view_plan(self):
+        sel=self.history_tree.selection()
+        if not sel:
+            messagebox.showinfo("Select Plan","Select a saved paycheck plan first.",parent=self); return
+        plan=self.plan_map.get(int(sel[0]))
+        if plan: AllocationPlanDetailsDialog(self,plan)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS VIEWER
 # ═════════════════════════════════════════════════════════════════════════════
 class TransactionsTab(tk.Frame):
@@ -3478,6 +4081,7 @@ NAV_ITEMS = [
     ("Accounts",  "🏦", ACCENT3),
     ("Transactions", "📋", ACCENT4),
     ("Budget",    "📊", ACCENT),
+    ("Allocation", "💸", ACCENT3),
     ("Income",    "📥", ACCENT),
     ("Expenses",  "📤", ACCENT2),
     ("Recurring", "🔁", ACCENT5),
@@ -3541,6 +4145,7 @@ class App(tk.Tk):
         self.acct = AccountsTab(self.content,        self._refresh)
         self.txn  = TransactionsTab(self.content, self._refresh)
         self.budget = BudgetTab(self.content)
+        self.allocation = AllocationTab(self.content)
         self.inc  = IncomeTab(self.content,          self._refresh)
         self.exp  = CombinedExpensesTab(self.content, self._refresh)
         self.rec  = RecurringTab(self.content,        self._refresh)
@@ -3550,6 +4155,7 @@ class App(tk.Tk):
             "Accounts":  self.acct,
             "Transactions": self.txn,
             "Budget":    self.budget,
+            "Allocation": self.allocation,
             "Income":    self.inc,
             "Expenses":  self.exp,
             "Recurring": self.rec,
@@ -3639,6 +4245,8 @@ class App(tk.Tk):
         # Refresh reports that depend on recently categorized/imported activity.
         if name == "Budget":
             self.budget.refresh()
+        elif name == "Allocation":
+            self.allocation.refresh()
 
         # Raise the right page
         self._pages[name].lift()
@@ -3648,6 +4256,7 @@ class App(tk.Tk):
         self.acct.refresh()
         self.txn.refresh()
         self.budget.refresh()
+        self.allocation.refresh()
 
 if __name__ == "__main__":
     App().mainloop()

@@ -7,7 +7,7 @@ The project is designed to bring everyday banking, transaction analysis, budgeti
 ## Project Status
 
 **Current development stage:** Update 3 — Budgeting & Paycheck Allocation  
-**Current implementation:** Update 3 - Commit 2.1 — Monthly Budget Copy Forward
+**Current implementation:** Update 3 - Commit 3 — Paycheck Allocation Rules
 
 | Update | Focus | Status |
 | --- | --- | --- |
@@ -55,6 +55,17 @@ The project is designed to bring everyday banking, transaction analysis, budgeti
 - Keep budget actuals month-specific based on each transaction's transaction date
 - Copy the previous month's saved budget plan into the selected month without overwriting destination budgets
 
+### Paycheck Allocation
+
+- Create reusable paycheck allocation rules for Bills, Spending, Savings, Investments, Debt, or Other
+- Use percentage-based rules, fixed-dollar rules, and one optional remainder rule
+- Preview how any paycheck amount would be divided before saving
+- Surface unallocated money and over-allocation instead of silently changing rules
+- Save immutable paycheck-plan snapshots for later review
+- Preserve historical saved plans even when allocation rules are edited later
+- Activate/deactivate rules without deleting saved history
+- Keep allocation planning separate from real banking transfers and normalized transactions
+
 ### Existing Personal Finance Tools
 
 - Dashboard summaries
@@ -99,7 +110,8 @@ personal-finance-manager/
 │   ├── test_update3_commit1.py
 │   ├── test_update3_commit2.py
 │   ├── test_update3_commit2_refresh_fix.py
-│   └── test_update3_commit2_1.py
+│   ├── test_update3_commit2_1.py
+│   └── test_update3_commit3.py
 ├── docs/
 │   ├── architecture.md
 │   ├── database.md
@@ -128,7 +140,7 @@ From the project root:
 
 ```bash
 python -m py_compile app.py
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -p "test_update*.py" -v
 ```
 
 Automated development tests use temporary SQLite databases so the project's real financial database is not required for test execution.
@@ -180,6 +192,7 @@ Update 2 - Commit 6: Account Reconciliation & Balance Accuracy
 Update 3 - Commit 1: Budget Data Model & Transaction Categories
 Update 3 - Commit 2: Budget Planning & Budget-vs-Actual Reporting
 Update 3 - Commit 2.1: Monthly Budget Copy Forward
+Update 3 - Commit 3: Paycheck Allocation Rules
 ```
 
 For additional project detail, see:
@@ -193,6 +206,6 @@ For additional project detail, see:
 
 ## Next Planned Work
 
-The next Update 3 work is expected to focus on **Update 3 - Commit 3: Paycheck Allocation Rules**, followed by **savings goals** and tighter integration between planned spending and actual normalized banking activity.
+The next Update 3 work is expected to focus on **savings goals**, followed by tighter integration between planned allocations, savings progress, and normalized banking activity.
 
 Later updates will add investment tracking, net-worth reporting, forecasting, long-term financial scenarios, and optional automated connectivity.

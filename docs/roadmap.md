@@ -101,7 +101,7 @@ The project is developed incrementally using the convention **Update # - Commit 
 - [x] Treat positive expense-category activity as a reduction of net category spending
 - [x] Complete real-data acceptance test and commit/push Commit 2
 
-### Commit 2.1 - Monthly Budget Copy Forward — Implemented / Acceptance Testing
+### Commit 2.1 - Monthly Budget Copy Forward — Complete
 - [x] Add Copy Previous Month action to Budget page
 - [x] Copy saved budget amounts and notes from the immediately previous calendar month
 - [x] Preserve existing destination-month budgets without overwriting them
@@ -109,11 +109,28 @@ The project is developed incrementally using the convention **Update # - Commit 
 - [x] Preserve source-month plans unchanged
 - [x] Keep transaction actuals month-specific; copy only plan records
 - [x] Handle December-to-January year boundaries
-- [ ] Complete real-data acceptance test and commit/push Commit 2.1
+- [x] Complete acceptance test and move forward to Commit 3
+
+### Commit 3 - Paycheck Allocation Rules — Implemented / Acceptance Testing
+- [x] `paycheck_allocation_rules` table
+- [x] Percentage, fixed-dollar, and remainder allocation methods
+- [x] Bills / Spending / Savings / Investments / Debt / Other buckets
+- [x] One active remainder rule maximum
+- [x] Rule add/edit/activate/deactivate workflow
+- [x] Paycheck allocation preview calculator
+- [x] Explicit unallocated and over-allocated reporting
+- [x] Prevent saving over-allocated plans
+- [x] `paycheck_allocation_plans` saved plan history
+- [x] `paycheck_allocation_items` immutable rule snapshots
+- [x] Dedicated Allocation sidebar page
+- [x] Saved-plan detail viewer
+- [x] Keep allocation planning separate from actual transfers/account balances
+- [x] Automated regression coverage using temporary SQLite databases
+- [ ] Complete real-data acceptance test and commit/push Commit 3
 
 ### Planned Next Commits
-- [ ] Commit 3 - Paycheck allocation rules
 - [ ] Savings goals
+- [ ] Connect savings-goal progress to normalized account/transaction activity
 - [ ] Continue connecting budgeting reports to normalized banking transactions
 
 ## Update 4 - Investments

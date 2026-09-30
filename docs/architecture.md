@@ -34,6 +34,7 @@ The application is still a single Python module. A module split is deferred unti
 - Account reconciliation
 - Budget/category data model
 - Monthly budget planning and budget-vs-actual reporting
+- Paycheck allocation rules, previews, and saved plan snapshots
 - Transaction category management
 - Dashboard
 - Income/paychecks
@@ -83,6 +84,16 @@ Budgeting / Categories
   copy_previous_month_budgets()
   delete_monthly_budget()
   get_budget_report()
+
+Paycheck Allocation
+  get_allocation_rules()
+  add_allocation_rule()
+  update_allocation_rule()
+  set_allocation_rule_active()
+  calculate_paycheck_allocation()
+  save_paycheck_allocation_plan()
+  get_recent_allocation_plans()
+  get_allocation_plan_items()
 ```
 
 ## Banking Data Flow
@@ -143,6 +154,7 @@ Dashboard
 Accounts
 Transactions
 Budget
+Allocation
 Income
 Expenses
 Recurring
@@ -172,6 +184,32 @@ Update 3 - Commit 2 adds a dedicated Budget page. The page navigates month-by-mo
 
 Update 3 - Commit 2.1 adds a non-destructive copy-forward workflow for monthly plans. While viewing a target month, the user can copy saved budgets from the immediately previous calendar month. Existing destination budgets are preserved and never overwritten, inactive categories are skipped, and only plan records are copied; transaction actuals remain tied to their own transaction dates.
 
+## Paycheck Allocation Architecture
+
+Update 3 - Commit 3 adds a planning layer that is deliberately separate from the banking ledger. Allocation rules describe how a paycheck *should* be divided, but previewing or saving a plan does not create a transaction, transfer funds, or modify account balances.
+
+```text
+paycheck_allocation_rules
+          |
+          v
+calculate_paycheck_allocation(paycheck amount)
+          |
+          +---- percentage rules: percent of full paycheck
+          +---- fixed rules: fixed dollar reservation
+          +---- optional remainder rule: receives leftover amount
+          |
+          v
+preview report
+          |
+          v
+paycheck_allocation_plans
+          |
+          v
+paycheck_allocation_items (immutable rule/value/amount snapshots)
+```
+
+Saved plan items copy the rule name, bucket, method, value, priority, and calculated amount at save time. Later edits to a reusable rule therefore do not rewrite historical paycheck plans. Over-allocation is surfaced explicitly and blocks saving rather than silently shrinking other rules.
+
 ## Future Direction
 
 As the project grows, the likely direction is:
@@ -186,6 +224,7 @@ Application / Domain Services
  +---- Transactions & Imports
  +---- Transfers
  +---- Budgeting
+ +---- Paycheck Allocation
  +---- Investments
  +---- Forecasting
  |

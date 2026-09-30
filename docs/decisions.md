@@ -199,3 +199,31 @@ The copy operation is intentionally non-destructive:
 - normalized transactions and actual spending are never copied or shifted between months.
 
 **Reason:** copy-forward should reduce repetitive data entry without silently replacing user-customized plans or changing financial history.
+---
+
+## ADR-017: Paycheck Allocation Is Planning-Only Until a Banking Action Is Explicitly Implemented
+
+**Status:** Accepted
+
+Update 3 - Commit 3 does not create transfers, modify account balances, or insert normalized banking transactions when a paycheck plan is previewed or saved. Allocation rules are planning instructions only.
+
+Rules may use three methods:
+
+- `percentage` — a percentage of the full paycheck;
+- `fixed` — a fixed dollar reservation;
+- `remainder` — one optional active rule that receives what remains after percentage/fixed rules.
+
+If percentage/fixed allocations exceed the paycheck, Finance Tracker reports the over-allocation and refuses to save the plan. It does not silently scale rules down.
+
+**Reason:** planning intent and real movement of money are different financial events. Keeping them separate prevents the application from manufacturing account activity that never occurred.
+
+---
+
+## ADR-018: Saved Paycheck Plans Preserve Rule Snapshots
+
+**Status:** Accepted
+
+Each saved paycheck plan stores line-item snapshots of the rule name, bucket, method, value, priority, and calculated amount. Reusable rules can be edited or deactivated later without rewriting historical plan records.
+
+**Reason:** a saved plan should remain an auditable record of what the user intended for that paycheck at the time it was created.
+

@@ -194,3 +194,55 @@ Update 3 does not automatically migrate or merge the legacy `paychecks` and `exp
 - Do not commit production databases or financial exports to Git.
 - Do not assume an imported CSV contains the complete lifetime history of an account.
 - Preserve reconciliation snapshots as history instead of overwriting previous snapshots.
+
+## Paycheck Allocation Tables
+
+### `paycheck_allocation_rules`
+Added in Update 3 - Commit 3. Stores reusable rules used to plan how a paycheck should be divided.
+
+| Column | Purpose |
+| --- | --- |
+| `id` | Primary key |
+| `name` | Unique rule name |
+| `bucket` | Bills, Spending, Savings, Investments, Debt, or Other |
+| `method` | `percentage`, `fixed`, or `remainder` |
+| `value` | Percent or fixed-dollar value; remainder rules store `0` |
+| `priority` | Display/evaluation ordering |
+| `is_active` | Active/inactive flag |
+| `note` | Optional planning note |
+| `created_at` | Creation timestamp |
+
+Only one active `remainder` rule is allowed. Percentage rules are calculated from the full paycheck amount; fixed rules reserve a fixed dollar amount; the optional remainder rule receives whatever is left after percentage/fixed rules.
+
+### `paycheck_allocation_plans`
+Stores saved paycheck-plan headers. A plan is a historical planning snapshot and is not a banking transaction.
+
+| Column | Purpose |
+| --- | --- |
+| `id` | Primary key |
+| `plan_date` | Date associated with the paycheck plan |
+| `paycheck_amount` | Paycheck amount used for the calculation |
+| `allocated_amount` | Total amount assigned by active rules |
+| `unallocated_amount` | Money left without an allocation |
+| `note` | Optional note |
+| `created_at` | Save timestamp |
+
+Plans that exceed the paycheck amount are rejected rather than saved.
+
+### `paycheck_allocation_items`
+Stores immutable line-item snapshots for each saved plan.
+
+| Column | Purpose |
+| --- | --- |
+| `id` | Primary key |
+| `plan_id` | Parent saved plan |
+| `rule_id` | Reusable rule that produced the item |
+| `rule_name` | Rule name copied at save time |
+| `bucket` | Bucket copied at save time |
+| `method` | Method copied at save time |
+| `rule_value` | Percent/fixed value copied at save time |
+| `amount` | Calculated dollar allocation |
+| `priority` | Priority copied at save time |
+
+The duplicated snapshot fields are intentional: editing a rule later must not change what an older paycheck plan says was intended at that time.
+
