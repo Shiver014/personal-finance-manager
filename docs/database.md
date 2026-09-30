@@ -135,6 +135,12 @@ Negative normalized transactions that are still uncategorized are reported separ
 
 Removing a monthly budget deletes only the plan for that category/month. It does not delete or alter transaction history.
 
+### Monthly Budget Copy Forward
+
+Update 3 - Commit 2.1 does not change the schema. `copy_previous_month_budgets()` reads saved `monthly_budgets` from the calendar month immediately before the selected target month and inserts missing target-month rows. Existing `(category_id, budget_month)` records in the target month are preserved rather than overwritten. Budget amount and note are copied for active expense categories only; inactive source categories are skipped.
+
+The copy operation duplicates only planning records. It does not copy, move, or modify normalized transactions, so budget actuals remain month-specific.
+
 ## Existing Legacy/Application Tables
 
 ### `paychecks`

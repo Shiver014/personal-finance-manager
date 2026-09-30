@@ -80,6 +80,7 @@ Budgeting / Categories
   assign_transaction_category()
   set_monthly_budget()
   get_monthly_budgets()
+  copy_previous_month_budgets()
   delete_monthly_budget()
   get_budget_report()
 ```
@@ -168,6 +169,8 @@ legacy paychecks / expenses
 A category has an explicit `expense` or `income` type. Assigning a category to a normalized transaction also sets that transaction's classification to the category type. Transfers are excluded from this model and continue to use the transfer workflow.
 
 Update 3 - Commit 2 adds a dedicated Budget page. The page navigates month-by-month, edits monthly category plans, and compares them with actual normalized transaction activity. Actual spending is calculated from `transactions` rows classified as `expense`; confirmed transfers and the legacy `paychecks`/`expenses` tables remain excluded. Uncategorized negative banking transactions are surfaced separately so incomplete categorization cannot silently make the budget appear healthier than the underlying bank activity.
+
+Update 3 - Commit 2.1 adds a non-destructive copy-forward workflow for monthly plans. While viewing a target month, the user can copy saved budgets from the immediately previous calendar month. Existing destination budgets are preserved and never overwritten, inactive categories are skipped, and only plan records are copied; transaction actuals remain tied to their own transaction dates.
 
 ## Future Direction
 

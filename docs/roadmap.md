@@ -87,7 +87,7 @@ The project is developed incrementally using the convention **Update # - Commit 
 - [x] Preserve legacy paycheck/expense tables without automatic migration or double-counting
 - [x] Complete real-data acceptance test and move forward to Commit 2
 
-### Commit 2 - Budget Planning UI & Budget-vs-Actual Reporting — Implemented / Acceptance Testing
+### Commit 2 - Budget Planning UI & Budget-vs-Actual Reporting — Complete
 - [x] Dedicated Budget sidebar page
 - [x] Previous/current/next month navigation
 - [x] Set or edit one monthly budget per expense category
@@ -99,10 +99,20 @@ The project is developed incrementally using the convention **Update # - Commit 
 - [x] Exclude confirmed transfers from budget actuals
 - [x] Keep legacy `paychecks` / `expenses` out of normalized budget actuals
 - [x] Treat positive expense-category activity as a reduction of net category spending
-- [ ] Complete real-data acceptance test and commit/push Commit 2
+- [x] Complete real-data acceptance test and commit/push Commit 2
+
+### Commit 2.1 - Monthly Budget Copy Forward — Implemented / Acceptance Testing
+- [x] Add Copy Previous Month action to Budget page
+- [x] Copy saved budget amounts and notes from the immediately previous calendar month
+- [x] Preserve existing destination-month budgets without overwriting them
+- [x] Skip inactive source categories
+- [x] Preserve source-month plans unchanged
+- [x] Keep transaction actuals month-specific; copy only plan records
+- [x] Handle December-to-January year boundaries
+- [ ] Complete real-data acceptance test and commit/push Commit 2.1
 
 ### Planned Next Commits
-- [ ] Paycheck allocation rules
+- [ ] Commit 3 - Paycheck allocation rules
 - [ ] Savings goals
 - [ ] Continue connecting budgeting reports to normalized banking transactions
 

@@ -631,6 +631,67 @@ def get_monthly_budgets(budget_month):
         conn.close()
 
 
+def copy_previous_month_budgets(target_month):
+    """Copy active expense budgets from the prior month without overwriting target plans.
+
+    Returns a summary dictionary containing source/target months and counts for copied,
+    skipped-existing, and skipped-inactive budget rows.
+    """
+    target = normalize_budget_month(target_month)
+    target_date = date.fromisoformat(target)
+    if target_date.month == 1:
+        source_date = date(target_date.year - 1, 12, 1)
+    else:
+        source_date = date(target_date.year, target_date.month - 1, 1)
+    source = source_date.isoformat()
+
+    conn = get_conn()
+    copied = 0
+    skipped_existing = 0
+    skipped_inactive = 0
+    try:
+        source_rows = conn.execute(
+            """SELECT b.category_id, b.amount, b.note, c.is_active, c.category_type
+               FROM monthly_budgets b
+               JOIN budget_categories c ON c.id=b.category_id
+               WHERE b.budget_month=?
+               ORDER BY c.name COLLATE NOCASE""",
+            (source,),
+        ).fetchall()
+
+        for category_id, amount, note, is_active, category_type in source_rows:
+            if category_type != "expense" or not is_active:
+                skipped_inactive += 1
+                continue
+            exists = conn.execute(
+                "SELECT 1 FROM monthly_budgets WHERE category_id=? AND budget_month=? LIMIT 1",
+                (category_id, target),
+            ).fetchone()
+            if exists:
+                skipped_existing += 1
+                continue
+            conn.execute(
+                """INSERT INTO monthly_budgets (category_id, budget_month, amount, note)
+                   VALUES (?,?,?,?)""",
+                (category_id, target, float(amount), str(note or "")),
+            )
+            copied += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "source_month": source,
+        "target_month": target,
+        "copied": copied,
+        "skipped_existing": skipped_existing,
+        "skipped_inactive": skipped_inactive,
+    }
+
+
 def delete_monthly_budget(budget_id):
     conn = get_conn()
     try:
@@ -3035,6 +3096,7 @@ class BudgetTab(tk.Frame):
         styled_btn(monthbar, "‹ Previous", self._previous_month, color=BORDER, fg=TEXT).pack(side="left")
         styled_btn(monthbar, "This Month", self._this_month, color=ACCENT5, fg=BG).pack(side="left", padx=8)
         styled_btn(monthbar, "Next ›", self._next_month, color=BORDER, fg=TEXT).pack(side="left")
+        styled_btn(monthbar, "Copy Previous Month", self._copy_previous_month, color=ACCENT4, fg=BG).pack(side="left", padx=(12,0))
         self.month_lbl = tk.Label(monthbar, text="", bg=BG, fg=ACCENT, font=FONT_H2)
         self.month_lbl.pack(side="right")
 
@@ -3159,6 +3221,43 @@ class BudgetTab(tk.Frame):
 
     def _manage_categories(self):
         CategoryManagerDialog(self, on_change=self.refresh)
+
+    def _copy_previous_month(self):
+        target_label = self.current_month.strftime("%B %Y")
+        if self.current_month.month == 1:
+            source_date = date(self.current_month.year - 1, 12, 1)
+        else:
+            source_date = date(self.current_month.year, self.current_month.month - 1, 1)
+        source_label = source_date.strftime("%B %Y")
+
+        if not messagebox.askyesno(
+            "Copy Previous Month",
+            f"Copy saved budgets from {source_label} into {target_label}?\n\n"
+            "Existing budgets in the destination month will be kept and will not be overwritten.",
+            parent=self,
+        ):
+            return
+        try:
+            result = copy_previous_month_budgets(self._month_text())
+        except Exception as exc:
+            messagebox.showerror("Copy Budget Error", str(exc), parent=self)
+            return
+
+        self.refresh()
+        if result["copied"] == 0 and result["skipped_existing"] == 0 and result["skipped_inactive"] == 0:
+            messagebox.showinfo(
+                "No Previous Budgets",
+                f"No saved budgets were found in {source_label}.",
+                parent=self,
+            )
+            return
+
+        details = [f"Copied {result['copied']} budget(s) from {source_label} to {target_label}."]
+        if result["skipped_existing"]:
+            details.append(f"Kept {result['skipped_existing']} existing destination budget(s) unchanged.")
+        if result["skipped_inactive"]:
+            details.append(f"Skipped {result['skipped_inactive']} inactive/non-expense source budget(s).")
+        messagebox.showinfo("Budgets Copied", "\n".join(details), parent=self)
 
     def _previous_month(self):
         if self.current_month.month == 1:

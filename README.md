@@ -7,7 +7,7 @@ The project is designed to bring everyday banking, transaction analysis, budgeti
 ## Project Status
 
 **Current development stage:** Update 3 — Budgeting & Paycheck Allocation  
-**Current implementation:** Update 3 - Commit 2 — Budget Planning & Budget-vs-Actual Reporting
+**Current implementation:** Update 3 - Commit 2.1 — Monthly Budget Copy Forward
 
 | Update | Focus | Status |
 | --- | --- | --- |
@@ -53,6 +53,7 @@ The project is designed to bring everyday banking, transaction analysis, budgeti
 - Exclude confirmed internal transfers from budget spending
 - Treat positive activity inside an expense category as a reduction to net spending, such as a refund
 - Keep budget actuals month-specific based on each transaction's transaction date
+- Copy the previous month's saved budget plan into the selected month without overwriting destination budgets
 
 ### Existing Personal Finance Tools
 
@@ -96,7 +97,9 @@ personal-finance-manager/
 ├── .gitignore
 ├── tests/
 │   ├── test_update3_commit1.py
-│   └── test_update3_commit2.py
+│   ├── test_update3_commit2.py
+│   ├── test_update3_commit2_refresh_fix.py
+│   └── test_update3_commit2_1.py
 ├── docs/
 │   ├── architecture.md
 │   ├── database.md
@@ -176,6 +179,7 @@ Update 2 - Commit 4: Transfer Detection & Handling
 Update 2 - Commit 6: Account Reconciliation & Balance Accuracy
 Update 3 - Commit 1: Budget Data Model & Transaction Categories
 Update 3 - Commit 2: Budget Planning & Budget-vs-Actual Reporting
+Update 3 - Commit 2.1: Monthly Budget Copy Forward
 ```
 
 For additional project detail, see:
@@ -189,6 +193,6 @@ For additional project detail, see:
 
 ## Next Planned Work
 
-The next Update 3 work is expected to focus on **paycheck allocation**, followed by **savings goals** and tighter integration between planned spending and actual normalized banking activity.
+The next Update 3 work is expected to focus on **Update 3 - Commit 3: Paycheck Allocation Rules**, followed by **savings goals** and tighter integration between planned spending and actual normalized banking activity.
 
 Later updates will add investment tracking, net-worth reporting, forecasting, long-term financial scenarios, and optional automated connectivity.

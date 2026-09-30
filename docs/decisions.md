@@ -180,3 +180,22 @@ Positive expense-category activity, such as a refund, reduces net actual spendin
 The legacy `expenses` and `paychecks` tables are not merged into budget actuals. This preserves ADR-013 and prevents duplicate counting while the application transitions toward the normalized ledger.
 
 Uncategorized negative banking transactions are displayed separately as **Uncategorized Outflow** rather than silently omitted from the user-facing summary. Removing a monthly budget removes only the plan record and never the underlying transaction history.
+
+
+---
+
+## ADR-016: Monthly Budget Copy Forward Never Overwrites Destination Plans
+
+**Status:** Accepted
+
+Budget plans commonly repeat month to month, so Finance Tracker may copy saved budgets from the immediately previous calendar month into the selected month.
+
+The copy operation is intentionally non-destructive:
+
+- existing destination-month budgets are preserved;
+- inactive source categories are skipped;
+- source-month records are not modified;
+- budget notes are copied with amounts;
+- normalized transactions and actual spending are never copied or shifted between months.
+
+**Reason:** copy-forward should reduce repetitive data entry without silently replacing user-customized plans or changing financial history.
